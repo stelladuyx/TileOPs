@@ -27,6 +27,7 @@ def test_fp8_quant_op(seq_len_kv: int, index_dim: int, in_dtype: torch.dtype, tu
 
     inputs = benchmark.gen_inputs()
     benchmark.check(op, inputs)
+    benchmark.profile(op, inputs)
 
 
 if __name__ == "__main__":

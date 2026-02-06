@@ -91,7 +91,7 @@ class Fp8QuantKernel(Kernel):
     @property
     def autotune_configs(self) -> list[dict]:
         num_stages = [0, 2]
-        block_m = [32]
+        block_m = [32, 64]
         _configs = list(itertools.product(num_stages, block_m))
 
         return [{'num_stages': c[0], 'block_m': c[1]} for c in _configs]

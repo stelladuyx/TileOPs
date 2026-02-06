@@ -203,7 +203,7 @@ class Fp8LightingIndexerKernel(Kernel):
 
     @property
     def default_config(self) -> dict:
-        return {"block_N": 64, "num_stages": 0, "threads": 128, "block_Q": 1}
+        return {"block_N": 64, "num_stages": 2, "threads": 128, "block_Q": 1}
 
     @property
     def autotune_configs(self) -> list[dict]:

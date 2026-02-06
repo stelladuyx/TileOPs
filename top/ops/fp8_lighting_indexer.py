@@ -36,11 +36,29 @@ class Fp8LightingIndexerOp(Op):
     def default_kernel_map(self) -> Dict[str, Kernel]:
         return {"Fp8LightingIndexerKernel": Fp8LightingIndexerKernel}
 
-    def forward(self, index_q: torch.Tensor, index_k: torch.Tensor, weights: torch.Tensor,
-                cu_seqlen_ks: torch.Tensor, cu_seqlen_ke: torch.Tensor) -> torch.Tensor:
+    def torch_quant_forward(self, index_q: torch.Tensor, index_k: torch.Tensor,
+                            weights: torch.Tensor, cu_seqlen_ks: torch.Tensor,
+                            cu_seqlen_ke: torch.Tensor) -> torch.Tensor:
         index_q = index_q.to(torch.float8_e4m3fn)
         index_k, index_k_scale = self.per_custom_dims_cast_to_fp8(index_k, (0,), False)
         return self.kernel(index_q, index_k, index_k_scale, weights, cu_seqlen_ks, cu_seqlen_ke)
+
+    def tl_quant_forward(self, index_q: torch.Tensor, index_k: torch.Tensor,
+                         index_k_scale: torch.Tensor, weights: torch.Tensor,
+                         cu_seqlen_ks: torch.Tensor, cu_seqlen_ke: torch.Tensor):
+        return self.kernel(index_q, index_k, index_k_scale, weights, cu_seqlen_ks, cu_seqlen_ke)
+
+    def forward(self, *args) -> torch.Tensor:
+        assert len(args) == 5 or len(
+            args
+        ) == 6, f"Invalid number of arguments passed to forward method. Expected 5 or 6, got {len(args)}."
+        if len(args) == 5:
+            index_q, index_k, weights, cu_seqlen_ks, cu_seqlen_ke = args
+            return self.torch_quant_forward(index_q, index_k, weights, cu_seqlen_ks, cu_seqlen_ke)
+        elif len(args) == 6:
+            index_q, index_k, index_k_scale, weights, cu_seqlen_ks, cu_seqlen_ke = args
+            return self.tl_quant_forward(index_q, index_k, index_k_scale, weights, cu_seqlen_ks,
+                                         cu_seqlen_ke)
 
     def per_custom_dims_cast_to_fp8(self, x: torch.Tensor, dims: Tuple[int],
                                     use_ue8m0: bool) -> Tuple[torch.Tensor, torch.Tensor]:
