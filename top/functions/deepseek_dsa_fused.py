@@ -38,14 +38,21 @@ class FusedDSACtx(torch.autograd.Function):
         # weights: [batch, seq_len, heads]
         # cu_seqlen_ks, cu_seqlen_ke: [batch, seq_len]
         seq_len = index_q.shape[1]
-        index_dtype = index_k_fp8.dtype
         seq_len_kv = index_k_fp8.shape[1]
 
-        cu_seqlen_ks = torch.zeros(seq_len, device='cuda', dtype=index_dtype)
-        cu_seqlen_ke = torch.full((seq_len,),
-                                  fill_value=seq_len_kv - 1,
-                                  device='cuda',
-                                  dtype=index_dtype)
+        # Use caller-provided cu_seqlen tensors. Ensure they are on the same
+        # device as inputs and have integer dtype expected by underlying ops.
+        device = index_q.device
+        if cu_seqlen_ks.device != device:
+            cu_seqlen_ks = cu_seqlen_ks.to(device)
+        if cu_seqlen_ke.device != device:
+            cu_seqlen_ke = cu_seqlen_ke.to(device)
+
+        if cu_seqlen_ks.dtype not in (torch.int32, torch.int64):
+            cu_seqlen_ks = cu_seqlen_ks.to(torch.int32)
+        if cu_seqlen_ke.dtype not in (torch.int32, torch.int64):
+            cu_seqlen_ke = cu_seqlen_ke.to(torch.int32)
+
         index_scores = indexer_op(index_q, index_k_fp8, weights, cu_seqlen_ks, cu_seqlen_ke)
 
         # Step 3: Select top-k indices
