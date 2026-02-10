@@ -18,7 +18,6 @@ class Fp8LightingIndexerOp(Op):
                  index_dim,
                  seq_len_kv,
                  clean_logits=True,
-                 config: Optional[dict] = None,
                  kernel_map: Optional[Dict[str, Kernel]] = None,
                  tune=False) -> None:
         self.seq_len = seq_len
@@ -26,11 +25,10 @@ class Fp8LightingIndexerOp(Op):
         self.index_dim = index_dim
         self.seq_len_kv = seq_len_kv
         self.clean_logits = clean_logits
-        self.config = config
 
         self.dispatch_kernel(kernel_map)
         self.kernel = self.kernel_map["Fp8LightingIndexerKernel"](
-            seq_len, heads, index_dim, seq_len_kv, clean_logits, config, tune=tune)
+            seq_len, heads, index_dim, seq_len_kv, clean_logits, tune=tune)
 
     @property
     def default_kernel_map(self) -> Dict[str, Kernel]:

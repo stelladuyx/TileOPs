@@ -1,4 +1,4 @@
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 
@@ -17,7 +17,6 @@ class Fp8LightingIndexerBenchmark(Benchmark):
         index_dim: int,
         seq_len_kv: int,
         clean_logits: bool = True,
-        config: Optional[dict] = None,
         is_causal: bool = True,
     ):
         self.seq_len = seq_len
@@ -25,7 +24,6 @@ class Fp8LightingIndexerBenchmark(Benchmark):
         self.index_dim = index_dim
         self.seq_len_kv = seq_len_kv
         self.clean_logits = clean_logits
-        self.config = config
         self.dtype = torch.float8_e4m3fn
         self.accum_dtype = torch.float32
         self.index_dtype = torch.int32

@@ -5,12 +5,10 @@ from top.functions import Fp8LightingIndexerFunc
 from top.layers import Fp8LightingIndexerDecodeLayer
 
 
-def test_fp8_lighting_indexer(seq_len, heads, index_dim, seq_len_kv, clean_logits, config):
-    fn = Fp8LightingIndexerFunc(seq_len, heads, index_dim, seq_len_kv, clean_logits, config)
-    layer = Fp8LightingIndexerDecodeLayer(seq_len, heads, index_dim, seq_len_kv, clean_logits,
-                                          config)
-    benchmark = Fp8LightingIndexerBenchmark(seq_len, heads, index_dim, seq_len_kv, clean_logits,
-                                            config)
+def test_fp8_lighting_indexer(seq_len, heads, index_dim, seq_len_kv, clean_logits):
+    fn = Fp8LightingIndexerFunc(seq_len, heads, index_dim, seq_len_kv, clean_logits)
+    layer = Fp8LightingIndexerDecodeLayer(seq_len, heads, index_dim, seq_len_kv, clean_logits)
+    benchmark = Fp8LightingIndexerBenchmark(seq_len, heads, index_dim, seq_len_kv, clean_logits)
 
     inputs = benchmark.gen_inputs()
 
@@ -42,20 +40,17 @@ if __name__ == "__main__":
         action=argparse.BooleanOptionalAction,
         default=True,
         help='whether to clean logits outside the valid range')
-    parser.add_argument('--config', type=str, default=None, help='positional encoding dim')
     parser.add_argument('--tune', action='store_true', default=False, help='enable autotune')
     args = parser.parse_args()
 
     test_fp8_lighting_indexer(args.seq_len, args.heads, args.index_dim, args.seq_len_kv,
-                              args.clean_logits, args.config)
+                              args.clean_logits)
 
 
-def test_fp8_lighting_indexer(seq_len, heads, index_dim, seq_len_kv, clean_logits, config):
-    fn = Fp8LightingIndexerFunc(seq_len, heads, index_dim, seq_len_kv, clean_logits, config)
-    layer = Fp8LightingIndexerDecodeLayer(seq_len, heads, index_dim, seq_len_kv, clean_logits,
-                                          config)
-    benchmark = Fp8LightingIndexerBenchmark(seq_len, heads, index_dim, seq_len_kv, clean_logits,
-                                            config)
+def test_fp8_lighting_indexer(seq_len, heads, index_dim, seq_len_kv, clean_logits):
+    fn = Fp8LightingIndexerFunc(seq_len, heads, index_dim, seq_len_kv, clean_logits)
+    layer = Fp8LightingIndexerDecodeLayer(seq_len, heads, index_dim, seq_len_kv, clean_logits)
+    benchmark = Fp8LightingIndexerBenchmark(seq_len, heads, index_dim, seq_len_kv, clean_logits)
 
     inputs = benchmark.gen_inputs()
 
@@ -87,9 +82,8 @@ if __name__ == "__main__":
         action=argparse.BooleanOptionalAction,
         default=True,
         help='whether to clean logits outside the valid range')
-    parser.add_argument('--config', type=str, default=None, help='positional encoding dim')
     parser.add_argument('--tune', action='store_true', default=False, help='enable autotune')
     args = parser.parse_args()
 
     test_fp8_lighting_indexer(args.seq_len, args.heads, args.index_dim, args.seq_len_kv,
-                              args.clean_logits, args.config)
+                              args.clean_logits)

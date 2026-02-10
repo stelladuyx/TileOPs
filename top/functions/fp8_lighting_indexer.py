@@ -1,4 +1,4 @@
-from typing import Optional, Any
+from typing import Any
 
 import torch
 from torch.autograd.function import FunctionCtx
@@ -32,17 +32,15 @@ class Fp8LightingIndexerFunc(Function):
                  index_dim,
                  seq_len_kv,
                  clean_logits=True,
-                 config: Optional[dict] = None,
                  tune=False) -> None:
         self.seq_len = seq_len
         self.heads = heads
         self.index_dim = index_dim
         self.seq_len_kv = seq_len_kv
         self.clean_logits = clean_logits
-        self.config = config
         self.tune = tune
         self.fwd_op = Fp8LightingIndexerOp(
-            seq_len, heads, index_dim, seq_len_kv, clean_logits, config, tune=tune)
+            seq_len, heads, index_dim, seq_len_kv, clean_logits, tune=tune)
 
     def forward(self, index_q: torch.Tensor, index_k: torch.Tensor, weights: torch.Tensor,
                 cu_seqlen_ks: torch.Tensor, cu_seqlen_ke: torch.Tensor) -> torch.Tensor:

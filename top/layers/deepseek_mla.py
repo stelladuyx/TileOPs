@@ -98,7 +98,6 @@ class Fp8LightingIndexerDecodeLayer(nn.Module):
                  index_dim,
                  seq_len_kv,
                  clean_logits=True,
-                 config: Optional[dict] = None,
                  tune=False) -> None:
         super().__init__()
 
@@ -109,7 +108,7 @@ class Fp8LightingIndexerDecodeLayer(nn.Module):
         self.clean_logits = clean_logits
         self.tune = tune
         self.fn = Fp8LightingIndexerFunc(
-            seq_len, heads, index_dim, seq_len_kv, clean_logits, config, tune=tune)
+            seq_len, heads, index_dim, seq_len_kv, clean_logits, tune=tune)
 
     def forward(self, index_q: torch.Tensor, index_k: torch.Tensor, weights: torch.Tensor,
                 cu_seqlen_ks: torch.Tensor, cu_seqlen_ke: torch.Tensor) -> torch.Tensor:
