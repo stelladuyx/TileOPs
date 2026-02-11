@@ -12,11 +12,13 @@ class Fp8QuantBenchmark(Benchmark):
 
     def __init__(
         self,
+        batch,
         seq_len_kv,
         index_dim,
         in_dtype,
         tune: bool = False,
     ) -> None:
+        self.batch = batch
         self.seq_len_kv = seq_len_kv
         self.index_dim = index_dim
         self.in_dtype = in_dtype
@@ -24,21 +26,21 @@ class Fp8QuantBenchmark(Benchmark):
 
     @property
     def total_flops(self) -> float:
-        return 2 * self.seq_len_kv * self.index_dim + self.seq_len_kv + 4 * self.seq_len_kv * self.index_dim
+        return 2 * self.batch * self.seq_len_kv * self.index_dim + self.batch * self.seq_len_kv + 4 * self.seq_len_kv * self.index_dim
 
     @property
     def total_memory(self) -> float:
         # input_tensor: seq_len_kv, index_dim
-        input_tensor_memory = self.seq_len_kv * self.index_dim * self.in_dtype.itemsize
+        input_tensor_memory = self.batch * self.seq_len_kv * self.index_dim * self.in_dtype.itemsize
         return input_tensor_memory
 
     def gen_inputs(self) -> torch.Tensor:
         input_tensor = torch.randn(
-            self.seq_len_kv, self.index_dim, dtype=self.in_dtype, device="cuda")
+            self.batch, self.seq_len_kv, self.index_dim, dtype=self.in_dtype, device="cuda")
         return input_tensor
 
     def ref_program(self, input_tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        amax_value = torch.abs(input_tensor).amax(dim=1, keepdim=True).clamp(min=1e-4)
+        amax_value = torch.abs(input_tensor).amax(dim=2, keepdim=True).clamp(min=1e-4)
         scale_tensor = amax_value / 448.0
         output_tensor = torch.clamp(input_tensor / scale_tensor, min=-448.0, max=448.0)
         output_tensor = output_tensor.to(torch.float8_e4m3fn)
@@ -79,6 +81,9 @@ class Fp8QuantBenchmark(Benchmark):
             if output_ref is not None:
                 output = output.to(torch.float32)
                 output_ref = output_ref.to(torch.float32)
+                print(output.flatten().shape)
+                print(output_ref.flatten().shape)
+
                 cos_sim = F.cosine_similarity(output.flatten(), output_ref.flatten(), dim=0)
                 cosine_threshold = 0.99
                 assert cos_sim >= cosine_threshold, f"outputs[{i}] is not close to outputs_ref[{i}]. Cosine similarity: {cos_sim.item()}"
