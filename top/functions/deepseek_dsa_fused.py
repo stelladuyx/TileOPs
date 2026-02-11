@@ -1,4 +1,4 @@
-from typing import Any, Optional
+from typing import Any
 import torch
 from torch.autograd.function import FunctionCtx
 
@@ -7,7 +7,7 @@ from top.ops import (Fp8QuantOp, Fp8LightingIndexerOp, TopkSelectorOp,
 
 from .function import Function
 
-__all__ = ['FusedDeepSeekSparseAttentionFunc']
+__all__ = ['DeepSeekDSAFusedFunc']
 
 
 class FusedDSACtx(torch.autograd.Function):
@@ -35,25 +35,25 @@ class FusedDSACtx(torch.autograd.Function):
         # Step 2: Compute index scores using indexer
         # index_q: [batch, seq_len, heads, index_dim]
         # index_k_fp8: [batch, seq_len_kv, index_dim]
-        # weights: [batch, seq_len, heads]
+        # weights: [seq_len, heads]
         # cu_seqlen_ks, cu_seqlen_ke: [batch, seq_len]
-        seq_len = index_q.shape[1]
-        seq_len_kv = index_k_fp8.shape[1]
+        # seq_len_kv = index_k_fp8.shape[1]
 
         # Use caller-provided cu_seqlen tensors. Ensure they are on the same
         # device as inputs and have integer dtype expected by underlying ops.
-        device = index_q.device
-        if cu_seqlen_ks.device != device:
-            cu_seqlen_ks = cu_seqlen_ks.to(device)
-        if cu_seqlen_ke.device != device:
-            cu_seqlen_ke = cu_seqlen_ke.to(device)
+        # device = index_q.device
+        # if cu_seqlen_ks.device != device:
+        #     cu_seqlen_ks = cu_seqlen_ks.to(device)
+        # if cu_seqlen_ke.device != device:
+        #     cu_seqlen_ke = cu_seqlen_ke.to(device)
 
-        if cu_seqlen_ks.dtype not in (torch.int32, torch.int64):
-            cu_seqlen_ks = cu_seqlen_ks.to(torch.int32)
-        if cu_seqlen_ke.dtype not in (torch.int32, torch.int64):
-            cu_seqlen_ke = cu_seqlen_ke.to(torch.int32)
+        # if cu_seqlen_ks.dtype not in (torch.int32, torch.int64):
+        #     cu_seqlen_ks = cu_seqlen_ks.to(torch.int32)
+        # if cu_seqlen_ke.dtype not in (torch.int32, torch.int64):
+        #     cu_seqlen_ke = cu_seqlen_ke.to(torch.int32)
 
-        index_scores = indexer_op(index_q, index_k_fp8, weights, cu_seqlen_ks, cu_seqlen_ke)
+        index_scores = indexer_op(index_q, index_k_fp8, index_k_scale, weights, cu_seqlen_ks,
+                                  cu_seqlen_ke)
 
         # Step 3: Select top-k indices
         # index_scores: [batch, seq_len, seq_len_kv]
@@ -73,7 +73,7 @@ class FusedDSACtx(torch.autograd.Function):
         raise RuntimeError("Inference-only op")
 
 
-class FusedDeepSeekSparseAttentionFunc(Function):
+class DeepSeekDSAFusedFunc(Function):
 
     def __init__(
             self,
@@ -99,7 +99,6 @@ class FusedDeepSeekSparseAttentionFunc(Function):
             #default arguments
             quant_in_dtype: torch.dtype = torch.float16,
             clean_logits: bool = True,
-            indexer_config: Optional[dict] = None,
             in_dtype: str = "float16",
             out_dtype: str = "int32",
             sm_scale: Any = None,
@@ -118,15 +117,19 @@ class FusedDeepSeekSparseAttentionFunc(Function):
         self.index_dim = index_dim
 
         self.quant_op = Fp8QuantOp(
-            seq_len_kv=seq_len_kv, index_dim=index_dim, in_dtype=quant_in_dtype, tune=tune)
+            batch=batch,
+            seq_len_kv=seq_len_kv,
+            index_dim=index_dim,
+            in_dtype=quant_in_dtype,
+            tune=tune)
 
         self.indexer_op = Fp8LightingIndexerOp(
+            batch=batch,
             seq_len=seq_len,
             heads=heads,
             index_dim=index_dim,
             seq_len_kv=seq_len_kv,
             clean_logits=clean_logits,
-            config=indexer_config,
             tune=tune)
 
         self.topk_op = TopkSelectorOp(
@@ -156,10 +159,10 @@ class FusedDeepSeekSparseAttentionFunc(Function):
     def forward(
         self,
         index_q: torch.Tensor,  # [batch, seq_len, heads, index_dim]
-        index_k: torch.Tensor,  # [batch, seq_len_kv, index_dim] (原始float16)
-        weights: torch.Tensor,  # [batch, seq_len, heads]
-        cu_seqlen_ks: torch.Tensor,  # [batch, seq_len]
-        cu_seqlen_ke: torch.Tensor,  # [batch, seq_len]
+        index_k: torch.Tensor,  # [batch, seq_len_kv, index_dim]
+        weights: torch.Tensor,  # seq_len, heads]
+        cu_seqlen_ks: torch.Tensor,  # [seq_len]
+        cu_seqlen_ke: torch.Tensor,  # [seq_len]
         starts: torch.Tensor,  # [batch] or [batch, seq_len]
         ends: torch.Tensor,  # [batch] or [batch, seq_len]
         query: torch.Tensor,  # [batch, seq_len, heads, dim]
@@ -171,9 +174,9 @@ class FusedDeepSeekSparseAttentionFunc(Function):
         Parameters:
         index_q: Query index vector [batch, seq_len, heads, index_dim]
         index_k: Key index vector [batch, seq_len_kv, index_dim] (will be quantized to FP8)
-        weights: Attention weights [batch, seq_len, heads]
-        cu_seqlen_ks: Starting positions of KV for each query token [batch, seq_len]
-        cu_seqlen_ke: Ending positions of KV for each query token [batch, seq_len]
+        weights: Attention weights [seq_len, heads]
+        cu_seqlen_ks: Starting positions of KV for each query token [seq_len]
+        cu_seqlen_ke: Ending positions of KV for each query token [seq_len]
         starts: Starting positions of topk selection [batch] or [batch, seq_len]
         ends: Ending positions of topk selection [batch] or [batch, seq_len]
         query: Query vector [batch, seq_len, heads, dim]
@@ -189,8 +192,8 @@ class FusedDeepSeekSparseAttentionFunc(Function):
         assert index_k.shape == (self.batch, self.seq_len_kv, self.index_dim), \
             f"index_k shape mismatch: {index_k.shape} != ({self.batch}, {self.seq_len_kv}, {self.index_dim})"
 
-        assert weights.shape == (self.batch, self.seq_len, self.heads), \
-            f"weights shape mismatch: {weights.shape} != ({self.batch}, {self.seq_len}, {self.heads})"
+        assert weights.shape == (self.seq_len, self.heads), \
+            f"weights shape mismatch: {weights.shape} != ( {self.seq_len}, {self.heads})"
 
         assert query.shape == (self.batch, self.seq_len, self.heads, self.dim), \
             f"query shape mismatch: {query.shape} != ({self.batch}, {self.seq_len}, {self.heads}, {self.dim})"

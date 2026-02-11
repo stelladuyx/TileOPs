@@ -61,7 +61,7 @@ class DeepSeekDSAFusedBenchmark:
                     self.heads,
                     self.index_dim,
                     dtype=self.in_dtype,
-                    device=self.device),
+                    device=self.device).to(torch.float8_e4m3fn),
             "index_k":
                 torch.randn(
                     self.batch,
@@ -69,16 +69,12 @@ class DeepSeekDSAFusedBenchmark:
                     self.index_dim,
                     dtype=self.in_dtype,
                     device=self.device),
-            "weights":
-                torch.rand(
-                    self.batch, self.seq_len, self.heads, dtype=self.in_dtype, device=self.device),
+            "indexer_weights":
+                torch.rand(self.seq_len, self.heads, dtype=self.in_dtype, device=self.device),
             "cu_seqlen_ks":
-                torch.zeros(self.batch, self.seq_len, dtype=torch.int32, device=self.device),
+                torch.zeros(self.seq_len, dtype=torch.int32, device=self.device),
             "cu_seqlen_ke":
-                torch.full((self.batch, self.seq_len),
-                           self.seq_len_kv,
-                           dtype=torch.int32,
-                           device=self.device),
+                torch.full((self.seq_len,), self.seq_len_kv, dtype=torch.int32, device=self.device),
             "starts":
                 torch.zeros(self.batch, dtype=torch.int32, device=self.device),
             "ends":
@@ -108,9 +104,9 @@ class DeepSeekDSAFusedBenchmark:
                  rtol: float = 1e-2,
                  grad: bool = False) -> None:
         """Check function correctness"""
-        output = fn(inputs["index_q"], inputs["index_k"], inputs["weights"], inputs["cu_seqlen_ks"],
-                    inputs["cu_seqlen_ke"], inputs["starts"], inputs["ends"], inputs["query"],
-                    inputs["kv_cache"])
+        output = fn(inputs["index_q"], inputs["index_k"], inputs["indexer_weights"],
+                    inputs["cu_seqlen_ks"], inputs["cu_seqlen_ke"], inputs["starts"],
+                    inputs["ends"], inputs["query"], inputs["kv_cache"])
 
         try:
             outputs_ref, cost = self.ref_program(*inputs)
@@ -151,8 +147,8 @@ class DeepSeekDSAFusedBenchmark:
 
         print(f"All checks passed for {fn.__class__.__name__}.✅")
 
-    def ref_program(self, index_q, index_k, weights, cu_seqlen_ks, cu_seqlen_ke, starts, ends,
-                    query, kv_cache) -> torch.Tensor:
+    def ref_program(self, index_q, index_k, indexer_weights, cu_seqlen_ks, cu_seqlen_ke, starts,
+                    ends, query, kv_cache) -> torch.Tensor:
         k = index_k
         index_q = index_q.float()
         k = k.float()
@@ -163,7 +159,7 @@ class DeepSeekDSAFusedBenchmark:
         mask = mask_lo & mask_hi
 
         score = torch.einsum("mhd,nd->hmn", index_q, k)
-        logits = (score.relu() * weights.unsqueeze(-1).transpose(0, 1)).sum(dim=0)
+        logits = (score.relu() * indexer_weights.unsqueeze(-1).transpose(0, 1)).sum(dim=0)
         logits = logits.masked_fill(~mask, float("-inf"))
         indices = torch.topk(logits, self.topk, dim=-1)[1]
 

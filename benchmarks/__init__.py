@@ -5,6 +5,7 @@ from .deepseek_mla import (
     Fp8LightingIndexerBenchmark,
     TopkSelectorBenchmark,
     Fp8QuantBenchmark,
+    DeepSeekDSAFusedBenchmark,
 )
 from .flash_attn import (
     GroupQueryAttentionBenchmark,
@@ -41,6 +42,7 @@ __all__ = [
     "MultiHeadLatentAttentionDecodeBenchmark",
     "DeepSeekSparseAttentionDecodeBenchmark",
     "Fp8QuantBenchmark",
+    "DeepSeekDSAFusedBenchmark",
     "MatMulBenchmark",
     "GroupedGemmBenchmark",
     "GroupedGemmNTBenchmark",
