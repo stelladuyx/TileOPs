@@ -7,18 +7,18 @@ from top.layers import Fp8QuantLayer
 
 
 @pytest.mark.parametrize(
-    ("seq_len_kv, index_dim, in_dtype, tune"),
+    ("batch, seq_len_kv, index_dim, in_dtype, tune"),
     [
-        (8192, 64, torch.float16, False),
-        (8192, 64, torch.bfloat16, False),
-        (4096, 128, torch.float32, False),
-        (16384, 32, torch.float32, False),
+        (1, 8192, 64, torch.float16, False),
+        (1, 8192, 64, torch.bfloat16, False),
+        (1, 4096, 128, torch.float32, False),
+        (1, 16384, 32, torch.float32, False),
     ],
 )
-def test_fp8_quant(seq_len_kv, index_dim, in_dtype, tune=False):
-    fn = Fp8QuantFunc(seq_len_kv, index_dim, in_dtype, tune=tune)
-    layer = Fp8QuantLayer(seq_len_kv, index_dim, in_dtype, tune=tune)
-    benchmark = Fp8QuantBenchmark(seq_len_kv, index_dim, in_dtype)
+def test_fp8_quant(batch, seq_len_kv, index_dim, in_dtype, tune=False):
+    fn = Fp8QuantFunc(batch, seq_len_kv, index_dim, in_dtype, tune=tune)
+    layer = Fp8QuantLayer(batch, seq_len_kv, index_dim, in_dtype, tune=tune)
+    benchmark = Fp8QuantBenchmark(batch, seq_len_kv, index_dim, in_dtype)
     inputs = benchmark.gen_inputs()
 
     try:
@@ -39,7 +39,7 @@ def test_fp8_quant(seq_len_kv, index_dim, in_dtype, tune=False):
 
 
 if __name__ == "__main__":
-    test_fp8_quant(8192, 64, torch.float16, False)
-    test_fp8_quant(8192, 64, torch.bfloat16, False)
-    test_fp8_quant(4096, 128, torch.float32, False)
-    test_fp8_quant(16384, 32, torch.float32, False)
+    test_fp8_quant(1, 8192, 64, torch.float16, False)
+    test_fp8_quant(1, 8192, 64, torch.bfloat16, False)
+    test_fp8_quant(1, 4096, 128, torch.float32, False)
+    test_fp8_quant(1, 16384, 32, torch.float32, False)
