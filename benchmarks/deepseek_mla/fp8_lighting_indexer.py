@@ -12,6 +12,7 @@ class Fp8LightingIndexerBenchmark(Benchmark):
 
     def __init__(
         self,
+        batch: int,
         seq_len: int,
         heads: int,
         index_dim: int,
@@ -19,6 +20,7 @@ class Fp8LightingIndexerBenchmark(Benchmark):
         clean_logits: bool = True,
         is_causal: bool = True,
     ):
+        self.batch = batch
         self.seq_len = seq_len
         self.heads = heads
         self.index_dim = index_dim
@@ -31,7 +33,7 @@ class Fp8LightingIndexerBenchmark(Benchmark):
     #todo
     @property
     def total_flops(self) -> float:
-        flops = self.cost * self.heads * self.index_dim * 2
+        flops = self.batch * self.cost * self.heads * self.index_dim * 2
         return flops
 
     @property
@@ -44,10 +46,10 @@ class Fp8LightingIndexerBenchmark(Benchmark):
         # CuSeqLenKS: seq_len
         # CuSeqLenKE: seq_len
 
-        index_q_memory = self.seq_len * self.heads * self.index_dim * self.dtype.itemsize
-        index_k_memory = self.seq_len_kv * self.index_dim * self.dtype.itemsize
-        index_k_scale_memory = self.seq_len_kv * self.accum_dtype.itemsize
-        logits_memory = self.seq_len * self.seq_len_kv * self.accum_dtype.itemsize
+        index_q_memory = self.batch * self.seq_len * self.heads * self.index_dim * self.dtype.itemsize
+        index_k_memory = self.batch * self.seq_len_kv * self.index_dim * self.dtype.itemsize
+        index_k_scale_memory = self.batch * self.seq_len_kv * self.accum_dtype.itemsize
+        logits_memory = self.batch * self.seq_len * self.seq_len_kv * self.accum_dtype.itemsize
         weights_memory = self.seq_len * self.heads * self.accum_dtype.itemsize
         cu_seqlens_ks_memory = self.seq_len * self.index_dtype.itemsize
         cu_seqlens_ke_memory = self.seq_len * self.index_dtype.itemsize
@@ -180,8 +182,14 @@ class Fp8LightingIndexerBenchmark(Benchmark):
             params=None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         IndexQ = torch.randn(
-            self.seq_len, self.heads, self.index_dim, device='cuda', dtype=torch.bfloat16)
-        IndexK = torch.randn(self.seq_len_kv, self.index_dim, device='cuda', dtype=torch.bfloat16)
+            self.batch,
+            self.seq_len,
+            self.heads,
+            self.index_dim,
+            device='cuda',
+            dtype=torch.bfloat16)
+        IndexK = torch.randn(
+            self.batch, self.seq_len_kv, self.index_dim, device='cuda', dtype=torch.bfloat16)
         Weights = torch.randn(self.seq_len, self.heads, device='cuda', dtype=self.accum_dtype)
         CuSeqLenKS = torch.zeros(self.seq_len, device='cuda', dtype=self.index_dtype)
         CuSeqLenKE = torch.full((self.seq_len,),
@@ -197,15 +205,22 @@ class Fp8LightingIndexerBenchmark(Benchmark):
         k = kv
         q = q.float()
         k = k.float()
+        batch = kv.shape[0]
+        seq_len_kv = kv.shape[1]
+        index_dim = kv.shape[2]
+        seq_len = weights.shape[0]
+        heads = weights.shape[1]
 
-        seq_len_kv = kv.shape[0]
+        q = q.view(batch, seq_len, heads, index_dim)
+
         mask_lo = torch.arange(0, seq_len_kv, device="cuda")[None, :] >= cu_seqlen_ks[:, None]
         mask_hi = torch.arange(0, seq_len_kv, device="cuda")[None, :] < cu_seqlen_ke[:, None]
         mask = mask_lo & mask_hi
 
-        score = torch.einsum("mhd,nd->hmn", q, k)
-        logits = (score.relu() * weights.unsqueeze(-1).transpose(0, 1)).sum(dim=0)
-        logits = logits.masked_fill(~mask, float("-inf"))
+        score = torch.einsum("bshd,bnd->bhns", q, k)
+        logits = (score.relu().transpose(2, 3) * weights.transpose(
+            0, 1).unsqueeze(0).unsqueeze(-1).expand(batch, heads, seq_len, seq_len_kv)).sum(dim=1)
+        logits = logits.masked_fill(~mask.unsqueeze(0), float("-inf"))
 
         cost = mask.sum()
         return logits, cost
@@ -250,7 +265,7 @@ class Fp8LightingIndexerBenchmark(Benchmark):
             a = a[0]
         if isinstance(b, tuple):
             b = b[0]
-
+        assert a.shape == b.shape, f"Shape mismatch between tensors {tensor_name}: torch {a.shape} vs tilelang {b.shape}"
         a_finite = torch.isfinite(a)
         b_finite = torch.isfinite(b)
         assert torch.all(a_finite == b_finite), "Error: isfinite mask mismatch"

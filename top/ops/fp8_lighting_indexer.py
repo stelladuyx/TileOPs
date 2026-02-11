@@ -13,6 +13,7 @@ __all__ = ["Fp8LightingIndexerOp"]
 class Fp8LightingIndexerOp(Op):
 
     def __init__(self,
+                 batch,
                  seq_len,
                  heads,
                  index_dim,
@@ -20,6 +21,7 @@ class Fp8LightingIndexerOp(Op):
                  clean_logits=True,
                  kernel_map: Optional[Dict[str, Kernel]] = None,
                  tune=False) -> None:
+        self.batch = batch
         self.seq_len = seq_len
         self.heads = heads
         self.index_dim = index_dim
@@ -28,7 +30,7 @@ class Fp8LightingIndexerOp(Op):
 
         self.dispatch_kernel(kernel_map)
         self.kernel = self.kernel_map["Fp8LightingIndexerKernel"](
-            seq_len, heads, index_dim, seq_len_kv, clean_logits, tune=tune)
+            batch, seq_len, heads, index_dim, seq_len_kv, clean_logits, tune=tune)
 
     @property
     def default_kernel_map(self) -> Dict[str, Kernel]:
@@ -39,6 +41,7 @@ class Fp8LightingIndexerOp(Op):
                             cu_seqlen_ke: torch.Tensor) -> torch.Tensor:
         index_q = index_q.to(torch.float8_e4m3fn)
         index_k, index_k_scale = self.per_custom_dims_cast_to_fp8(index_k, (0,), False)
+
         return self.kernel(index_q, index_k, index_k_scale, weights, cu_seqlen_ks, cu_seqlen_ke)
 
     def tl_quant_forward(self, index_q: torch.Tensor, index_k: torch.Tensor,
@@ -60,11 +63,10 @@ class Fp8LightingIndexerOp(Op):
 
     def per_custom_dims_cast_to_fp8(self, x: torch.Tensor, dims: Tuple[int],
                                     use_ue8m0: bool) -> Tuple[torch.Tensor, torch.Tensor]:
-        excluded_dims = tuple([i for i in range(x.dim()) if i not in set(dims)])
-        x_amax = x.to(torch.float32).abs().float().amax(dim=excluded_dims, keepdim=True).clamp(1e-4)
+        x_amax = x.to(torch.float32).abs().float().amax(dim=2, keepdim=True).clamp(1e-4)
         sf = x_amax / 448.0
         if use_ue8m0:
             assert sf.view(-1).amax().item() > 0
             sf = torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
         x_scaled = (x * (1.0 / sf)).to(torch.float8_e4m3fn)
-        return x_scaled, sf.squeeze()
+        return x_scaled, sf.squeeze(-1)

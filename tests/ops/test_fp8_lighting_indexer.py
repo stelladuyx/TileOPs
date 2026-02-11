@@ -4,14 +4,16 @@ from benchmarks import Fp8LightingIndexerBenchmark
 from top.ops import Fp8LightingIndexerOp
 
 
-def test_indexer(seq_len: int,
+def test_indexer(batch: int,
+                 seq_len: int,
                  heads: int,
                  index_dim: int,
                  seq_len_kv: int,
                  clean_logits: bool,
                  tune: bool = False) -> None:
-    op = Fp8LightingIndexerOp(seq_len, heads, index_dim, seq_len_kv, clean_logits, tune=tune)
-    benchmark = Fp8LightingIndexerBenchmark(seq_len, heads, index_dim, seq_len_kv, clean_logits)
+    op = Fp8LightingIndexerOp(batch, seq_len, heads, index_dim, seq_len_kv, clean_logits, tune=tune)
+    benchmark = Fp8LightingIndexerBenchmark(batch, seq_len, heads, index_dim, seq_len_kv,
+                                            clean_logits)
 
     inputs = benchmark.gen_inputs()
 
@@ -21,6 +23,7 @@ def test_indexer(seq_len: int,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument('--batch', type=int, default=1, help='batch size')
     parser.add_argument('--seq_len', type=int, default=4096, help='sequence length')
     parser.add_argument('--heads', type=int, default=32, help='number of heads')
     parser.add_argument('--index_dim', type=int, default=64, help='index dim')
@@ -33,5 +36,5 @@ if __name__ == "__main__":
     parser.add_argument('--tune', action='store_true', default=False, help='enable autotune')
     args = parser.parse_args()
 
-    test_indexer(args.seq_len, args.heads, args.index_dim, args.seq_len_kv, args.clean_logits,
-                 args.tune)
+    test_indexer(args.batch, args.seq_len, args.heads, args.index_dim, args.seq_len_kv,
+                 args.clean_logits, args.tune)
