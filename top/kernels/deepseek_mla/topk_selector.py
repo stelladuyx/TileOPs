@@ -22,7 +22,7 @@ def convert_to_uint16(x):
 
 
 def convert_to_uint32(x):
-    bits_uint = T.reinterpret(T.uint32, x)
+    bits_uint = T.reinterpret(T.uint32, T.Cast(T.float32, x))
     bits_uint = T.if_then_else(
         x < 0,
         ~bits_uint & T.Cast(T.uint32, (0xFFFFFFFF)),

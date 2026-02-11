@@ -70,7 +70,7 @@ class DeepSeekDSAFusedBenchmark:
                     dtype=self.in_dtype,
                     device=self.device),
             "indexer_weights":
-                torch.rand(self.seq_len, self.heads, dtype=self.in_dtype, device=self.device),
+                torch.rand(self.seq_len, self.heads, dtype=torch.float32, device=self.device),
             "cu_seqlen_ks":
                 torch.zeros(self.seq_len, dtype=torch.int32, device=self.device),
             "cu_seqlen_ke":
