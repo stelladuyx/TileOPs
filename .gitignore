@@ -1,0 +1,53 @@
+# Compiled Object files
+*.o
+*.obj
+*.pyc
+
+# Editor files
+*~
+*.swp
+*.swo
+.vscode/
+.vs/
+.idea/*
+
+# Build artifacts
+build/
+dist/
+wheelhouse/
+build_sdist/
+__pycache__
+*.egg-info
+
+# Virtual environments
+venv/
+.venv/
+.tox/
+
+# Git merge artifacts
+*.orig
+\#*
+\.#*
+
+# macOS
+**/.DS_Store
+
+# Logs and data
+*.log
+*.pkl_*
+
+# Test / lint caches
+.pytest_cache
+.hypothesis
+.ruff_cache
+.cache/
+
+# Output / profiling
+output/
+output*/
+profile_out/
+tmp/
+debug/
+
+# Exception: keep the debug folder for tests
+!testing/python/debug
