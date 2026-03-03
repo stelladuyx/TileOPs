@@ -1,5 +1,6 @@
 from typing import Any
 
+import time
 import torch
 from torch.autograd.function import FunctionCtx
 
@@ -24,26 +25,47 @@ class FusedDSACtx(torch.autograd.Function):
         cu_seqlen_ke: torch.Tensor,  # [seq_len]
         starts: torch.Tensor,  # [batch, seq_len]
         ends: torch.Tensor,  # [batch, seq_len]
-        query: torch.Tensor,  # [batch, seq_len, heads, dim]
-        kv_cache: torch.Tensor,  # [batch, seq_len_kv, heads, dim+dim_tail]
+        query: torch.Tensor,  # [batch, seq_len, heads, dim + dim_tail]
+        kv_cache: torch.Tensor,  # [batch, seq_len_kv, kv_group, dim + dim_tail]
         quant_op: Fp8QuantOp,
         indexer_op: Fp8LightingIndexerOp,
         topk_op: TopkSelectorOp,
         dsa_op: DeepSeekSparseAttentionDecodeWithKVCacheOp,
     ) -> torch.Tensor:
+        t0 = time.time()
+        print("[FusedDSA] forward start", flush=True)
+
         # 1) Quantize index_k to FP8
+        print("[FusedDSA] step1 quant_op...", flush=True)
         index_k_scale, index_k_fp8 = quant_op(index_k)
+        t1 = time.time()
+        print(f"[FusedDSA] step1 done in {t1 - t0:.3f}s", flush=True)
 
         # 2) Compute index scores using indexer
+        print("[FusedDSA] step2 indexer_op...", flush=True)
         index_scores = indexer_op(index_q, index_k_fp8, index_k_scale, weights, cu_seqlen_ks,
                                   cu_seqlen_ke)
+        t2 = time.time()
+        print(f"[FusedDSA] step2 done in {t2 - t1:.3f}s", flush=True)
 
         # 3) Select top‑k indices
+        print("[FusedDSA] step3 topk_op...", flush=True)
         indices = topk_op(index_scores, starts, ends)
+        t3 = time.time()
+        print(f"[FusedDSA] step3 done in {t3 - t2:.3f}s", flush=True)
 
         # 4) Sparse attention decode with selected indices
+        print("[FusedDSA] step4 dsa_op...", flush=True)
         output = dsa_op(query, kv_cache, indices)
+        t4 = time.time()
+        print(f"[FusedDSA] step4 done in {t4 - t3:.3f}s, total {t4 - t0:.3f}s", flush=True)
         return output
+
+        # return index_k_scale
+
+    @staticmethod
+    def get_output_shape(input_shape: tuple[int, ...]) -> tuple[int, ...]:
+        return input_shape
 
     @staticmethod
     def backward(ctx: FunctionCtx, do: torch.Tensor) -> Any:
@@ -144,14 +166,14 @@ class DeepSeekDSAFusedFunc(Function):
     def forward(
         self,
         index_q: torch.Tensor,  # [batch, seq_len, heads, index_dim]
-        index_k: torch.Tensor,  # [batch, seq_len_kv, index_dim]
+        index_k: torch.Tensor,  # [batch, seq_len_kv, kv_group, index_dim]
         weights: torch.Tensor,  # [seq_len, heads]
         cu_seqlen_ks: torch.Tensor,  # [seq_len]
         cu_seqlen_ke: torch.Tensor,  # [seq_len]
         starts: torch.Tensor,  # [batch, seq_len]
         ends: torch.Tensor,  # [batch, seq_len]
-        query: torch.Tensor,  # [batch, seq_len, heads, dim]
-        kv_cache: torch.Tensor,  # [batch, seq_len_kv, heads, dim+dim_tail]
+        query: torch.Tensor,  # [batch, seq_len, heads, dim + dim_tail]
+        kv_cache: torch.Tensor,  # [batch, seq_len_kv, kv_group, dim + dim_tail]
     ) -> torch.Tensor:
         """
         Sparse attention fusion forward propagation.
@@ -174,9 +196,17 @@ class DeepSeekDSAFusedFunc(Function):
             f"weights shape mismatch: {weights.shape} != ({self.seq_len}, {self.heads})"
         )
 
-        assert query.shape == (self.batch, self.seq_len, self.heads, self.dim), (
+        expected_query_shape = (self.batch, self.seq_len, self.heads,
+                                self.dim + self.dim_tail)
+        assert query.shape == expected_query_shape, (
             f"query shape mismatch: {query.shape} "
-            f"!= ({self.batch}, {self.seq_len}, {self.heads}, {self.dim})"
+            f"!= {expected_query_shape}"
+        )
+
+        expected_kv_shape = (self.batch, self.seq_len_kv, self.group_kv,
+                             self.dim + self.dim_tail)
+        assert kv_cache.shape == expected_kv_shape, (
+            f"kv_cache shape mismatch: {kv_cache.shape} != {expected_kv_shape}"
         )
 
         return FusedDSACtx.apply(

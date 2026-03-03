@@ -12,6 +12,7 @@ class DsaDecodeFixture(FixtureBase):
         ("batch, heads, seq_len_q, seq_len_kv, dim, dim_tail, topk, stride_kv, heads_kv, "
          "q_start_index_s, sm_scale, dtype, tune", [
              (1, 128, 1024, 2048, 512, 64, 2048, 1, 1, 1024, None, torch.float16, False),
+            #   (1, 64, 512, 1024, 256, 32, 128, 1, 1, 512, None, torch.float16, False),
          ]),
     ]
 

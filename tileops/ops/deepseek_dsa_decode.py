@@ -1,5 +1,7 @@
 from typing import Dict, Optional
 
+import contextlib
+import time
 import torch
 
 from tileops.kernels.deepseek_mla import SparseMlaKernel
@@ -123,4 +125,15 @@ class DeepSeekSparseAttentionDecodeWithKVCacheOp(Op):
             torch.Tensor: The result of applying the sparse attention
                             operation on the input tensors.
         """
-        return self.kernel(q, kv, indices)
+        t0 = time.time()
+        print("[DeepSeekDSAOp] forward start", flush=True)
+        with contextlib.suppress(Exception):
+            print(
+                f"[DeepSeekDSAOp] shapes q={tuple(q.shape)}, kv={tuple(kv.shape)}, indices={tuple(indices.shape)}",
+                flush=True,
+            )
+
+        out = self.kernel(q, kv, indices)
+        t1 = time.time()
+        print(f"[DeepSeekDSAOp] kernel finished in {t1 - t0:.3f}s", flush=True)
+        return out
