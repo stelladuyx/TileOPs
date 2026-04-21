@@ -227,33 +227,55 @@ def test_ssd_state_passing_fwd(batch, num_chunks, n_heads, d_state, dtype, tune)
 
 
 def ssd_decode_ref(
-    A: torch.Tensor,      # (H,)          float32
-    dt: torch.Tensor,     # (B, H)        float32
+    A: torch.Tensor,      # (H, P, N)     float32
+    dt: torch.Tensor,     # (B, H, P)     float32
     x: torch.Tensor,      # (B, H, P)     any dtype
     B_in: torch.Tensor,   # (B, G, N)     any dtype
     C_in: torch.Tensor,   # (B, G, N)     any dtype
     state: torch.Tensor,  # (B, H, P, N)  float32  -- updated in-place
 ) -> torch.Tensor:
-    """PyTorch reference for ssd_decode."""
-    B, H = dt.shape
+    """PyTorch reference for ssd_decode.
+
+    Matches the official Mamba-2 selective_state_update interface:
+      A:  (nheads, headdim, d_state)   — repeated from (nheads,) in mamba2.step()
+      dt: (batch,  nheads,  headdim)   — repeated from (batch, nheads) in mamba2.step()
+
+    Returns:
+      y_out: (B, H, P)  float32
+
+    Semantics:
+      g                = h // (n_heads // n_groups)
+      dA[b, h, p, n]   = exp(dt[b,h,p] * A[h,p,n])
+      state[b,h,p,n]  <- dA[b,h,p,n] * state[b,h,p,n]
+                         + dt[b,h,p] * B_in[b,g,n] * x[b,h,p]   (in-place)
+      y_out[b, h, p]   = sum_n  state[b, h, p, n] * C_in[b, g, n]
+    """
+    B, H, P = dt.shape
     G = B_in.shape[1]
     heads_per_group = H // G
 
-    dA = torch.exp(dt.float() * A.float())
-
+    # Expand B/C from groups to heads: (B, H, N)
     head_idx = torch.arange(H, device=B_in.device) // heads_per_group
-    B_heads = B_in.float()[:, head_idx, :]
-    C_heads = C_in.float()[:, head_idx, :]
+    B_heads = B_in.float()[:, head_idx, :]   # (B, H, N)
+    C_heads = C_in.float()[:, head_idx, :]   # (B, H, N)
 
+    # dA[b, h, p, n] = exp(dt[b,h,p] * A[h,p,n])
+    dA = torch.exp(
+        dt.float()[:, :, :, None] * A.float()[None, :, :, :]
+    )  # (B, H, P, N)
+
+    # dBx[b, h, p, n] = dt[b,h,p] * B[b,h,n] * x[b,h,p]
     dBx = (
-        dt.float()[:, :, None, None]
+        dt.float()[:, :, :, None]
         * x.float()[:, :, :, None]
         * B_heads[:, :, None, :]
-    )
+    )  # (B, H, P, N)
 
-    new_state = dA[:, :, None, None] * state.float() + dBx
+    # Update state in-place
+    new_state = dA * state.float() + dBx
     state.copy_(new_state)
 
+    # y_out[b, h, p] = sum_n state[b, h, p, n] * C[b, h, n]
     y_out = torch.einsum("bhpn,bhn->bhp", state.float(), C_heads)
     return y_out
 

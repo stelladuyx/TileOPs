@@ -197,8 +197,8 @@ class SSDDecodeTest(WorkloadBase):
             self.batch, self.n_heads, self.d_head, self.d_state, self.n_groups,
         )
         # A <= 0 (negative decay), dt > 0 (post-softplus)
-        A = -torch.rand(h, dtype=torch.float32, device="cuda")
-        dt = torch.rand(b, h, dtype=torch.float32, device="cuda") * 0.1 + 0.01
+        A = -torch.rand(h, p, n, dtype=torch.float32, device="cuda")
+        dt = torch.rand(b, h, p, dtype=torch.float32, device="cuda") * 0.1 + 0.01
         x = torch.randn(b, h, p, dtype=self.dtype, device="cuda") * 0.1
         B_in = torch.randn(b, g, n, dtype=self.dtype, device="cuda") * 0.1
         C_in = torch.randn(b, g, n, dtype=self.dtype, device="cuda") * 0.1

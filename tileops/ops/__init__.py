@@ -85,6 +85,7 @@ from .rope import (
 from .ssd_chunk_scan import SSDChunkScanFwdOp
 from .ssd_chunk_state import SSDChunkStateFwdOp
 from .ssd_decode import SSDDecodeOp
+from .ssd_dx_bwd_fused import SsdDxBwdFusedOp
 from .ssd_state_passing import SSDStatePassingFwdOp
 from .topk_selector import TopkSelectorOp
 
@@ -149,6 +150,7 @@ __all__ = [
     "SSDChunkScanFwdOp",
     "SSDChunkStateFwdOp",
     "SSDDecodeOp",
+    "SsdDxBwdFusedOp",
     "SSDStatePassingFwdOp",
     "RopeLlama31Op",
     "RopeLongRopeOp",
