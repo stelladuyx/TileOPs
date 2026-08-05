@@ -244,6 +244,14 @@ def main() -> int:
         help="upcoming files importing in advance while the current file runs",
     )
     parser.add_argument(
+        "--exclusive-gpu-process",
+        action="store_true",
+        help=(
+            "serialize child import, execution, and teardown for GPUs in "
+            "exclusive-process compute mode"
+        ),
+    )
+    parser.add_argument(
         "--timing-backend",
         choices=TIMING_BACKENDS,
         help="force one GPU timing backend in every benchmark child process",
@@ -259,6 +267,8 @@ def main() -> int:
         help="disable CUDA-events fallback so a requested timing backend fails closed",
     )
     args = parser.parse_args()
+    if args.exclusive_gpu_process:
+        args.prewarm = 0
 
     # Children inherit the parent environment. Configure timing once here so
     # every implementation measured by BenchmarkBase (TileOps, Torch, Triton,
@@ -318,7 +328,8 @@ def main() -> int:
         try:
             for index, bench_file in enumerate(bench_files):
                 child = pending.popleft()
-                top_up()
+                if not args.exclusive_gpu_process:
+                    top_up()
                 rel = os.path.relpath(bench_file)
                 print(f"\n=== [{index + 1}/{len(bench_files)}] {rel} ===", flush=True)
                 fragment = work_dir / f"{index:03d}.xml"
@@ -375,6 +386,12 @@ def main() -> int:
                         failed.append(rel)
                 print(f"--- {rel} finished in {elapsed:.0f}s ---", flush=True)
                 _absorb_profile_log(profile_parts)
+                if args.exclusive_gpu_process:
+                    # Exclusive-process GPUs reject the next child while the
+                    # previous Python process still owns a CUDA context. Do
+                    # not even import the next benchmark until teardown ends.
+                    note_anomalies(_reap_lingering(lingering, block=True))
+                    top_up()
         finally:
             for leftover in pending:
                 leftover.kill()

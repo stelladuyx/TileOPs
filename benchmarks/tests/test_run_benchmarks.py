@@ -237,3 +237,33 @@ def test_teardown_deadline_enforced_during_next_file(tmp_path):
     assert "stuck in teardown" in out
     assert out.index("stuck in teardown") < out.index("bench_b_next.py finished")
     assert any("bench_a_slow_teardown" in k for k in _cases(out_xml))
+
+
+def test_exclusive_gpu_process_waits_before_importing_next_file(tmp_path):
+    bench_dir = _write_bench_dir(
+        tmp_path,
+        {
+            "bench_a_owner.py": (
+                "import atexit, pathlib, time\n"
+                "def release():\n"
+                "    time.sleep(1)\n"
+                "    pathlib.Path('gpu_released').write_text('yes')\n"
+                "atexit.register(release)\n"
+                "def test_owner():\n    pass\n"
+            ),
+            "bench_b_next.py": (
+                "import pathlib\n"
+                "assert pathlib.Path('gpu_released').exists()\n"
+                "def test_next():\n    pass\n"
+            ),
+        },
+    )
+    proc, out_xml, _ = _run_runner(
+        tmp_path,
+        bench_dir,
+        timeout_per_file="120",
+        extra=["--exclusive-gpu-process", "--teardown-timeout", "5"],
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert len(_cases(out_xml)) == 2
