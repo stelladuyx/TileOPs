@@ -147,6 +147,9 @@ def _measurement(
         "activity_sequence": list(
             getattr(_bench_meta, "expected_activity_sequence", [])
         ),
+        "direct_boundary_margins_ns": list(
+            getattr(_bench_meta, "direct_boundary_margins_ns", [])
+        ),
     }
 
 
@@ -154,6 +157,7 @@ def _aggregate(
     measurements: list[dict[str, Any]],
     cases: list[str],
     rounds: int,
+    clock_shift_risk_us: float = 2.0,
 ) -> dict[str, Any]:
     aggregate: dict[str, Any] = {}
     for case_name in cases:
@@ -172,6 +176,13 @@ def _aggregate(
                 for item in successful
                 for sample in item["raw_samples_ms"]
             ]
+            boundary_margins = [
+                margin
+                for item in successful
+                for margin in item.get("direct_boundary_margins_ns", [])
+            ]
+            left_margins = [margin[0] for margin in boundary_margins]
+            right_margins = [margin[1] for margin in boundary_margins]
             first_half = latencies[: max(1, len(latencies) // 2)]
             second_half = latencies[len(latencies) // 2 :]
             drift_ratio = None
@@ -183,6 +194,13 @@ def _aggregate(
                 "success_rate": len(successful) / rounds,
                 "round_latency_ms": _summary(latencies),
                 "raw_samples_ms": _summary(raw_samples),
+                "left_boundary_margin_ns": _summary(left_margins),
+                "right_boundary_margin_ns": _summary(right_margins),
+                "clock_shift_unsafe_samples": sum(
+                    left < clock_shift_risk_us * 1_000
+                    or right < clock_shift_risk_us * 1_000
+                    for left, right in boundary_margins
+                ),
                 "first_to_second_half_median_ratio": drift_ratio,
                 "errors": [item for item in selected if item["status"] == "error"],
             }
@@ -193,6 +211,12 @@ def _acceptance_failures(aggregate: dict[str, Any], args: argparse.Namespace) ->
     failures = []
     for case_name, backends in aggregate.items():
         direct = backends["cupti-direct"]
+        unsafe_samples = direct["clock_shift_unsafe_samples"]
+        if unsafe_samples:
+            failures.append(
+                f"{case_name}: {unsafe_samples} direct CUPTI samples have less "
+                f"than {args.clock_shift_risk_us:g} us timestamp guard"
+            )
         if direct["success_rate"] < 1 - args.max_failure_rate:
             failures.append(
                 f"{case_name}: direct CUPTI success rate "
@@ -232,6 +256,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-drift", type=float, default=0.05)
     parser.add_argument("--max-failure-rate", type=float, default=0.0)
     parser.add_argument("--max-direct-kineto-delta", type=float, default=0.10)
+    parser.add_argument(
+        "--clock-shift-risk-us",
+        type=float,
+        default=2.0,
+        help="fail if a direct activity span is closer than this to either window boundary",
+    )
     parser.add_argument(
         "--direct-metric",
         choices=("activity-sum", "activity-span"),
@@ -291,7 +321,9 @@ def main() -> int:
         else:
             os.environ["TILEOPS_DIRECT_CUPTI_METRIC"] = old_direct_metric
 
-    aggregate = _aggregate(measurements, list(cases), args.rounds)
+    aggregate = _aggregate(
+        measurements, list(cases), args.rounds, args.clock_shift_risk_us
+    )
     failures = _acceptance_failures(aggregate, args)
     report = {
         "schema_version": 1,

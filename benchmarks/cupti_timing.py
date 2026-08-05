@@ -103,6 +103,11 @@ class DirectCuptiMeasurement:
     samples_ms: list[float]
     expected_sequence: list[tuple[str, int, int, int, str]]
     metric: str
+    # Conservative guard bands around the complete selected GPU activity span.
+    # A pair is ``(first_activity_start - window_start,
+    # window_end - last_activity_end)`` in nanoseconds.  Negative values mean
+    # the normalized GPU span crossed a CPU timestamp boundary.
+    boundary_margins_ns: list[tuple[int, int]]
 
 
 def load_cupti_api() -> Any:
@@ -301,6 +306,7 @@ def measure_direct_cupti(
     )
     starts = [activity.start for activity in timed_activities]
     samples_ms: list[float] = []
+    boundary_margins_ns: list[tuple[int, int]] = []
     expected_counts = Counter(expected)
     for iteration, (start, end) in enumerate(timestamp_windows):
         left = bisect.bisect_left(starts, start)
@@ -318,16 +324,20 @@ def measure_direct_cupti(
             raise DirectCuptiTraceError(
                 f"invalid GPU activity duration at iteration {iteration}"
             )
+        first_activity_start = min(activity.start for activity in selected)
+        last_activity_end = max(activity.end for activity in selected)
+        boundary_margins_ns.append(
+            (first_activity_start - start, end - last_activity_end)
+        )
         if metric == "activity-sum":
             duration_ns = sum(activity.end - activity.start for activity in selected)
         else:
-            duration_ns = max(activity.end for activity in selected) - min(
-                activity.start for activity in selected
-            )
+            duration_ns = last_activity_end - first_activity_start
         samples_ms.append(duration_ns / 1e6)
 
     return DirectCuptiMeasurement(
         samples_ms=samples_ms,
         expected_sequence=expected,
         metric=metric,
+        boundary_margins_ns=boundary_margins_ns,
     )

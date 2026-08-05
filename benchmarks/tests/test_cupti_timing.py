@@ -104,6 +104,7 @@ def test_measure_direct_cupti_filters_setup_and_measures_multikernel(
     assert result.samples_ms == pytest.approx(expected_samples)
     assert result.metric == metric
     assert result.expected_sequence == direct.activity_sequence(discovery.activities)
+    assert result.boundary_margins_ns == [(20, 10), (20, 50)]
     assert calls.count("sync") == 3  # discovery plus two timed iterations
 
 
@@ -184,3 +185,8 @@ def test_direct_cupti_gpu_returns_stable_complete_samples():
     ratio = statistics.median(second.samples_ms) / statistics.median(first.samples_ms)
     assert 0.8 < ratio < 1.2
     assert first.expected_sequence == second.expected_sequence
+    assert len(first.boundary_margins_ns) == len(second.boundary_margins_ns) == 20
+    assert all(
+        left >= 0 and right >= 0
+        for left, right in first.boundary_margins_ns + second.boundary_margins_ns
+    )

@@ -200,6 +200,7 @@ def _bench_with_direct_cupti(
     trial_means: list[float] = []
     raw_samples: list[float] = []
     expected_sequence: list[Any] = []
+    boundary_margins_ns: list[tuple[int, int]] = []
 
     def prepare_iteration(_iteration: int) -> None:
         cache.zero_()
@@ -222,7 +223,9 @@ def _bench_with_direct_cupti(
                 "discovery activity sequence changed between timing trials"
             )
         raw_samples.extend(measurement.samples_ms)
+        boundary_margins_ns.extend(measurement.boundary_margins_ns)
         trial_means.append(statistics.mean(measurement.samples_ms))
+    _bench_meta.direct_boundary_margins_ns = boundary_margins_ns
     return trial_means, raw_samples, expected_sequence
 
 
@@ -385,6 +388,9 @@ def bench_kernel(
     _bench_meta.inputs_cloned = arg_pool is not None or not has_args
 
     try:
+        # Prevent diagnostics from a prior direct-CUPTI call leaking into a
+        # Kineto/CUDA-events measurement or a failed direct attempt.
+        _bench_meta.direct_boundary_margins_ns = []
         # Warmup is deliberately outside all profiler/activity contexts.
         for iteration in range(n_warmup):
             cache.zero_()
@@ -585,6 +591,20 @@ class BenchmarkBase(Generic[W], ABC):
             result["timing_trial_means_ms"] = getattr(
                 _bench_meta, "trial_means_ms", []
             )
+            boundary_margins = getattr(
+                _bench_meta, "direct_boundary_margins_ns", []
+            )
+            if boundary_margins:
+                result["timing_left_boundary_min_us"] = min(
+                    margin[0] for margin in boundary_margins
+                ) / 1_000
+                result["timing_right_boundary_min_us"] = min(
+                    margin[1] for margin in boundary_margins
+                ) / 1_000
+                result["timing_clock_shift_unsafe_2us"] = sum(
+                    left < 2_000 or right < 2_000
+                    for left, right in boundary_margins
+                )
         if getattr(_bench_meta, "inputs_cloned", True) is False:
             result["inputs_cloned"] = False
         flops = self.calculate_flops()

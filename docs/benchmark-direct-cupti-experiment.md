@@ -141,6 +141,41 @@ failures.
 This also verifies repeated direct CUPTI enable/flush/disable/finalize cycles in
 one process across synthetic, TileOps, and PyTorch callables.
 
+## Two-microsecond CPU/GPU timestamp-offset risk
+
+CUPTI normalizes GPU activity timestamps onto the CPU timeline using linear
+interpolation. A constant offset does not change an activity's own duration,
+but it can move an activity across a CPU timestamp-window boundary and make
+attribution fail. The direct backend now records conservative per-sample guard
+bands from the CPU window start to the first activity start and from the last
+activity end to the CPU window end. The stability tool rejects any sample with
+less than the configurable `--clock-shift-risk-us` guard (default 2 us).
+
+On H200, 6,900 newly instrumented direct-CUPTI samples had zero 2-us-unsafe
+windows. Representative minimum guards were:
+
+| Case                                |  GPU span | Samples | Min left guard | Min right guard | Unsafe at 2 us |
+| ----------------------------------- | --------: | ------: | -------------: | --------------: | -------------: |
+| PyTorch add, 4K BF16                |  1.855 us |     900 |       9.343 us |        4.848 us |              0 |
+| PyTorch two-kernel add/mul          | 11.966 us |     900 |       9.241 us |        4.676 us |              0 |
+| TileOps ReLU decode, 1x4096 BF16    |  1.784 us |     300 |      27.157 us |       22.229 us |              0 |
+| TileOps RMSNorm decode, 1x4096 BF16 |  2.676 us |     300 |      46.550 us |       26.715 us |              0 |
+| TileOps L2Norm, 2048x4096 BF16      |  9.178 us |     900 |      48.769 us |        7.808 us |              0 |
+| TileOps Sum, 2048x4096 BF16         |  9.114 us |     300 |      48.008 us |       20.785 us |              0 |
+| TileOps GEMV, M1 N7168 K2048 BF16   | 18.923 us |     300 |      24.193 us |        6.743 us |              0 |
+| TileOps GEMM, 1024x1024x1024 BF16   | 14.512 us |     300 |      33.077 us |        6.652 us |              0 |
+| TileOps elementwise Neg, 16M BF16   | 18.769 us |     300 |      28.662 us |        7.858 us |              0 |
+| PyTorch L2Norm, 2048x4096 BF16      | 53.222 us |     900 |      10.998 us |        4.830 us |              0 |
+
+The shortest measured TileOps kernels are therefore not automatically the
+highest attribution risk: their Python/TileLang dispatch before launch and the
+post-call CUDA synchronization provide substantially more than 2 us of guard.
+The remaining high-risk configurations are lower-overhead native launchers,
+timestamp windows without a post-call synchronization, work launched from a
+different host thread after the wrapper returns, and back-to-back windows on
+non-default streams. Those configurations are not used by the current TileOps
+benchmark path and require a separate native-launch stress test before support.
+
 ### Rejected as default: upstream `activity-span`
 
 The same 10-round experiment with upstream SOL-ExecBench span semantics was

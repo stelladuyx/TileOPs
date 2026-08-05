@@ -261,6 +261,7 @@ def test_bench_kernel_uses_direct_cupti_backend_by_default(monkeypatch):
     assert _bench_meta.timing == "cupti-direct"
     assert _bench_meta.requested_timing == "cupti-direct"
     assert _bench_meta.raw_samples_ms == [0.010, 0.011, 0.012]
+    assert _bench_meta.direct_boundary_margins_ns == []
     assert _bench_meta.fallback_reason is None
 
 
