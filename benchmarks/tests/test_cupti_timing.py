@@ -104,11 +104,28 @@ def test_measure_direct_cupti_filters_setup_and_measures_multikernel(
     assert result.samples_ms == pytest.approx(expected_samples)
     assert result.activity_sum_ms == pytest.approx([0.00005, 0.00007])
     assert result.activity_span_ms == pytest.approx([0.00007, 0.00008])
+    assert result.activity_union_busy_ms == pytest.approx([0.00005, 0.00007])
+    assert result.inter_activity_idle_ms == pytest.approx([0.00002, 0.00001])
+    assert result.activity_overlap_ms == pytest.approx([0.0, 0.0])
     assert result.inter_activity_gap_ms == pytest.approx([0.00002, 0.00001])
     assert result.metric == metric
     assert result.expected_sequence == direct.activity_sequence(discovery.activities)
     assert result.boundary_margins_ns == [(20, 10), (20, 50)]
     assert calls.count("sync") == 3  # discovery plus two timed iterations
+
+
+def test_activity_timeline_components_separates_idle_and_overlap():
+    overlapping = [
+        _activity("a", 100, 120, 1),
+        _activity("b", 110, 130, 2),
+        _activity("c", 140, 150, 3),
+    ]
+
+    components = direct.activity_timeline_components_ns(overlapping)
+
+    # Sum=50, span=50, union busy=40, idle=10, overlap=10.  The legacy
+    # span-sum value is zero and would hide both effects.
+    assert components == (50, 50, 40, 10, 10)
 
 
 def test_measure_direct_cupti_fails_when_an_iteration_is_incomplete(monkeypatch):

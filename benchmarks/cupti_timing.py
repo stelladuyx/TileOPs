@@ -103,6 +103,11 @@ class DirectCuptiMeasurement:
     samples_ms: list[float]
     activity_sum_ms: list[float]
     activity_span_ms: list[float]
+    activity_union_busy_ms: list[float]
+    inter_activity_idle_ms: list[float]
+    activity_overlap_ms: list[float]
+    # Legacy algebraic value: span - sum == idle - overlap.  It is an exact
+    # idle gap only when the selected activities do not overlap.
     inter_activity_gap_ms: list[float]
     expected_sequence: list[tuple[str, int, int, int, str]]
     metric: str
@@ -133,6 +138,29 @@ def activity_sequence(
 
 def activity_counts(activities: list[CuptiActivityInfo]) -> Counter:
     return Counter(activity_sequence(activities))
+
+
+def activity_timeline_components_ns(
+    activities: list[CuptiActivityInfo],
+) -> tuple[int, int, int, int, int]:
+    """Return ``(sum, span, union_busy, idle, overlap)`` in nanoseconds."""
+    if not activities:
+        raise ValueError("activity timeline requires at least one activity")
+    intervals = sorted((activity.start, activity.end) for activity in activities)
+    duration_sum = sum(end - start for start, end in intervals)
+    span = max(end for _, end in intervals) - intervals[0][0]
+    union_busy = 0
+    merged_start, merged_end = intervals[0]
+    for start, end in intervals[1:]:
+        if start <= merged_end:
+            merged_end = max(merged_end, end)
+        else:
+            union_busy += merged_end - merged_start
+            merged_start, merged_end = start, end
+    union_busy += merged_end - merged_start
+    idle = span - union_busy
+    overlap = duration_sum - union_busy
+    return duration_sum, span, union_busy, idle, overlap
 
 
 def _relative_order_score(
@@ -311,6 +339,9 @@ def measure_direct_cupti(
     samples_ms: list[float] = []
     activity_sum_ms: list[float] = []
     activity_span_ms: list[float] = []
+    activity_union_busy_ms: list[float] = []
+    inter_activity_idle_ms: list[float] = []
+    activity_overlap_ms: list[float] = []
     inter_activity_gap_ms: list[float] = []
     boundary_margins_ns: list[tuple[int, int]] = []
     expected_counts = Counter(expected)
@@ -335,12 +366,15 @@ def measure_direct_cupti(
         boundary_margins_ns.append(
             (first_activity_start - start, end - last_activity_end)
         )
-        sum_ns = sum(activity.end - activity.start for activity in selected)
-        span_ns = last_activity_end - first_activity_start
-        gap_ns = span_ns - sum_ns
+        sum_ns, span_ns, union_busy_ns, idle_ns, overlap_ns = (
+            activity_timeline_components_ns(selected)
+        )
         activity_sum_ms.append(sum_ns / 1e6)
         activity_span_ms.append(span_ns / 1e6)
-        inter_activity_gap_ms.append(gap_ns / 1e6)
+        activity_union_busy_ms.append(union_busy_ns / 1e6)
+        inter_activity_idle_ms.append(idle_ns / 1e6)
+        activity_overlap_ms.append(overlap_ns / 1e6)
+        inter_activity_gap_ms.append((span_ns - sum_ns) / 1e6)
         duration_ns = sum_ns if metric == "activity-sum" else span_ns
         samples_ms.append(duration_ns / 1e6)
 
@@ -348,6 +382,9 @@ def measure_direct_cupti(
         samples_ms=samples_ms,
         activity_sum_ms=activity_sum_ms,
         activity_span_ms=activity_span_ms,
+        activity_union_busy_ms=activity_union_busy_ms,
+        inter_activity_idle_ms=inter_activity_idle_ms,
+        activity_overlap_ms=activity_overlap_ms,
         inter_activity_gap_ms=inter_activity_gap_ms,
         expected_sequence=expected,
         metric=metric,

@@ -56,7 +56,7 @@ def _summary(values: list[float]) -> dict[str, float | int | None]:
 
 
 def _cases(
-    device: str, *, include_tileops_l2: bool
+    device: str, *, include_tileops_l2: bool, include_cuda_graph: bool
 ) -> dict[str, tuple[Callable, tuple[Any, ...]]]:
     dtype = torch.bfloat16
 
@@ -85,6 +85,23 @@ def _cases(
         "medium-single-kernel": (medium_matmul, (medium_a, medium_b, medium_out)),
         "fast-multi-kernel": (multi_kernel, (multi_a, multi_b)),
     }
+    if include_cuda_graph:
+        graph_a = multi_a.clone()
+        graph_b = multi_b.clone()
+        capture_stream = torch.cuda.Stream(device=device)
+        capture_stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(capture_stream):
+            # Populate allocator and library state before capture.
+            multi_kernel(graph_a, graph_b)
+        capture_stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=capture_stream):
+            multi_kernel(graph_a, graph_b)
+
+        def multi_kernel_graph():
+            graph.replay()
+
+        cases["fast-multi-kernel-graph"] = (multi_kernel_graph, ())
     if include_tileops_l2:
         from tileops.ops.reduction.vector_norm import L2NormFwdOp
 
@@ -156,6 +173,15 @@ def _measurement(
         "direct_activity_span_ms": list(
             getattr(_bench_meta, "direct_activity_span_ms", [])
         ),
+        "direct_activity_union_busy_ms": list(
+            getattr(_bench_meta, "direct_activity_union_busy_ms", [])
+        ),
+        "direct_inter_activity_idle_ms": list(
+            getattr(_bench_meta, "direct_inter_activity_idle_ms", [])
+        ),
+        "direct_activity_overlap_ms": list(
+            getattr(_bench_meta, "direct_activity_overlap_ms", [])
+        ),
         "direct_inter_activity_gap_ms": list(
             getattr(_bench_meta, "direct_inter_activity_gap_ms", [])
         ),
@@ -207,6 +233,21 @@ def _aggregate(
                 for item in successful
                 for sample in item.get("direct_inter_activity_gap_ms", [])
             ]
+            activity_union_busy = [
+                sample
+                for item in successful
+                for sample in item.get("direct_activity_union_busy_ms", [])
+            ]
+            inter_activity_idle = [
+                sample
+                for item in successful
+                for sample in item.get("direct_inter_activity_idle_ms", [])
+            ]
+            activity_overlap = [
+                sample
+                for item in successful
+                for sample in item.get("direct_activity_overlap_ms", [])
+            ]
             round_activity_sums = [
                 statistics.mean(item["direct_activity_sum_ms"])
                 for item in successful
@@ -237,6 +278,9 @@ def _aggregate(
                 "right_boundary_margin_ns": _summary(right_margins),
                 "direct_activity_sum_ms": _summary(activity_sums),
                 "direct_activity_span_ms": _summary(activity_spans),
+                "direct_activity_union_busy_ms": _summary(activity_union_busy),
+                "direct_inter_activity_idle_ms": _summary(inter_activity_idle),
+                "direct_activity_overlap_ms": _summary(activity_overlap),
                 "direct_inter_activity_gap_ms": _summary(inter_activity_gaps),
                 "round_direct_activity_sum_ms": _summary(round_activity_sums),
                 "round_direct_activity_span_ms": _summary(round_activity_spans),
@@ -326,6 +370,7 @@ def parse_args() -> argparse.Namespace:
         "--output", type=Path, default=Path("timing_stability.json")
     )
     parser.add_argument("--include-tileops-l2", action="store_true")
+    parser.add_argument("--include-cuda-graph", action="store_true")
     return parser.parse_args()
 
 
@@ -338,7 +383,11 @@ def main() -> int:
     # Fail before running a long experiment if the isolated environment is not
     # actually capable of loading the direct CUPTI API.
     load_cupti_api().get_timestamp()
-    cases = _cases(args.device, include_tileops_l2=args.include_tileops_l2)
+    cases = _cases(
+        args.device,
+        include_tileops_l2=args.include_tileops_l2,
+        include_cuda_graph=args.include_cuda_graph,
+    )
     measurements: list[dict[str, Any]] = []
     old_backend = os.environ.get("TILEOPS_TIMING_BACKEND")
     old_fallback = os.environ.get("TILEOPS_ALLOW_CUDA_EVENTS_FALLBACK")

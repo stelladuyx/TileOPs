@@ -206,6 +206,50 @@ activities, including rare millisecond-scale host submission stalls. Exact SOL
 span semantics therefore measure launch-pipeline behavior for short
 multi-kernel callables rather than only GPU execution time.
 
+### Gap anatomy and tuning experiment
+
+For sequential activities on one stream, the measured idle gap between
+activity N and N+1 can contain host framework/dispatcher work that was not
+finished before N completed, CUDA runtime and driver launch work, command-buffer
+queue/submission delay, GPU scheduling or resource delay, stream/event
+dependencies, context interference, and host descheduling. Work that overlaps
+activity N does not contribute to the observed GPU idle interval.
+
+For concurrent streams, `span - sum` is not a pure gap because activity
+durations overlap. The collector therefore also computes the union of all
+activity intervals and reports:
+
+```text
+span = union GPU busy + inter-activity idle
+sum  = union GPU busy + multiply-counted overlap
+```
+
+CUPTI can further expose kernel `queued` and `submitted` timestamps when
+latency timestamp collection is enabled before CUDA initialization. Together
+with runtime/driver API correlation, those timestamps can separate host launch,
+command-buffer submission, and GPU scheduling portions in a dedicated process.
+
+To test whether gap reduction is actionable, the same locked-GPU1 add/mul pair
+was compared as ordinary eager launches and as one CUDA Graph replay. Both
+paths retained the same two kernel identities. The process remained pinned to
+CPU2 and all sampled clocks remained 1500 MHz SM / 3201 MHz memory.
+
+| Metric                     |      Eager | CUDA Graph | Change |
+| -------------------------- | ---------: | ---------: | -----: |
+| Activity-sum round median  |   3.626 us |   2.852 us | -21.3% |
+| Idle gap median            |   7.616 us |   0.320 us | -95.8% |
+| Activity-span round median |  11.565 us |   3.179 us | -72.5% |
+| Activity-span round CV     |      5.25% |      0.27% |        |
+| Maximum idle gap           | 113.408 us |   0.353 us |        |
+
+Reducing gap is therefore a valid end-to-end tuning direction for repeated,
+short multi-kernel workflows. Kernel fusion, CUDA Graph replay, native/batched
+launch, persistent kernels, removing host round trips, and eliminating
+unnecessary stream/event waits are candidate techniques. It should remain a
+separate objective from kernel-body tuning: per-kernel implementation history
+uses activity-sum, while application/workflow latency can use activity-span and
+idle-gap diagnostics.
+
 ### Rejected as default: upstream `activity-span`
 
 The same 10-round experiment with upstream SOL-ExecBench span semantics was

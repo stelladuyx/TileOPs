@@ -203,6 +203,9 @@ def _bench_with_direct_cupti(
     boundary_margins_ns: list[tuple[int, int]] = []
     activity_sum_ms: list[float] = []
     activity_span_ms: list[float] = []
+    activity_union_busy_ms: list[float] = []
+    inter_activity_idle_ms: list[float] = []
+    activity_overlap_ms: list[float] = []
     inter_activity_gap_ms: list[float] = []
 
     def prepare_iteration(_iteration: int) -> None:
@@ -229,11 +232,17 @@ def _bench_with_direct_cupti(
         boundary_margins_ns.extend(measurement.boundary_margins_ns)
         activity_sum_ms.extend(measurement.activity_sum_ms)
         activity_span_ms.extend(measurement.activity_span_ms)
+        activity_union_busy_ms.extend(measurement.activity_union_busy_ms)
+        inter_activity_idle_ms.extend(measurement.inter_activity_idle_ms)
+        activity_overlap_ms.extend(measurement.activity_overlap_ms)
         inter_activity_gap_ms.extend(measurement.inter_activity_gap_ms)
         trial_means.append(statistics.mean(measurement.samples_ms))
     _bench_meta.direct_boundary_margins_ns = boundary_margins_ns
     _bench_meta.direct_activity_sum_ms = activity_sum_ms
     _bench_meta.direct_activity_span_ms = activity_span_ms
+    _bench_meta.direct_activity_union_busy_ms = activity_union_busy_ms
+    _bench_meta.direct_inter_activity_idle_ms = inter_activity_idle_ms
+    _bench_meta.direct_activity_overlap_ms = activity_overlap_ms
     _bench_meta.direct_inter_activity_gap_ms = inter_activity_gap_ms
     return trial_means, raw_samples, expected_sequence
 
@@ -402,6 +411,9 @@ def bench_kernel(
         _bench_meta.direct_boundary_margins_ns = []
         _bench_meta.direct_activity_sum_ms = []
         _bench_meta.direct_activity_span_ms = []
+        _bench_meta.direct_activity_union_busy_ms = []
+        _bench_meta.direct_inter_activity_idle_ms = []
+        _bench_meta.direct_activity_overlap_ms = []
         _bench_meta.direct_inter_activity_gap_ms = []
         # Warmup is deliberately outside all profiler/activity contexts.
         for iteration in range(n_warmup):
