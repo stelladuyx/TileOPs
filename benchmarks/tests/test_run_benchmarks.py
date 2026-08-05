@@ -146,7 +146,7 @@ def test_fragments_and_profile_logs_merge(tmp_path):
 def test_timing_configuration_reaches_every_benchmark_child(tmp_path):
     expected = (
         "    assert os.environ['TILEOPS_TIMING_BACKEND'] == 'cupti-direct'\n"
-        "    assert os.environ['TILEOPS_DIRECT_CUPTI_METRIC'] == 'activity-sum'\n"
+        "    assert os.environ['TILEOPS_DIRECT_CUPTI_METRIC'] == 'activity-span'\n"
         "    assert os.environ['TILEOPS_ALLOW_CUDA_EVENTS_FALLBACK'] == '0'\n"
     )
     bench_dir = _write_bench_dir(
@@ -168,13 +168,13 @@ def test_timing_configuration_reaches_every_benchmark_child(tmp_path):
             "--timing-backend",
             "cupti-direct",
             "--direct-metric",
-            "activity-sum",
+            "activity-span",
             "--fail-on-timing-fallback",
         ],
     )
 
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "backend=cupti-direct, metric=activity-sum" in proc.stdout
+    assert "backend=cupti-direct, metric=activity-span" in proc.stdout
     assert "cuda-events-fallback=disabled" in proc.stdout
     assert len(_cases(out_xml)) == 2
 

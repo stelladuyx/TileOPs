@@ -6,10 +6,13 @@ generic ``BenchmarkBase`` / ``ManifestBenchmark`` accept workloads through
 protocol contracts rather than nominal ``WorkloadBase`` inheritance.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 import benchmarks.benchmark_base as benchmark_base
+import benchmarks.cupti_timing as cupti_timing
 from benchmarks.benchmark_base import (
     BenchmarkReport,
     BenchmarkWorkload,
@@ -17,6 +20,7 @@ from benchmarks.benchmark_base import (
     ManifestBenchmark,
     ShapeDtypeWorkload,
     _bench_meta,
+    _kineto_activity_times_us,
     bench_kernel,
     workloads_to_params,
 )
@@ -75,6 +79,110 @@ class _FakeRooflineOp:
     def eval_roofline(self) -> tuple[int, int]:
         self.calls += 1
         return self._roofline
+
+
+class _FakeKinetoEvent:
+    def __init__(self, name, start_ns, duration_ns, *, annotation=False):
+        self._name = name
+        self._start_ns = start_ns
+        self._duration_ns = duration_ns
+        self._annotation = annotation
+
+    def device_type(self):
+        return benchmark_base.DeviceType.CUDA
+
+    def is_user_annotation(self):
+        return self._annotation
+
+    def name(self):
+        return self._name
+
+    def start_ns(self):
+        return self._start_ns
+
+    def end_ns(self):
+        return self._start_ns + self._duration_ns
+
+    def duration_ns(self):
+        return self._duration_ns
+
+
+class _FakeKinetoResults:
+    def __init__(self, events):
+        self._events = events
+
+    def events(self):
+        return self._events
+
+
+def test_kineto_parser_derives_independent_sum_and_span_per_region():
+    results = _FakeKinetoResults(
+        [
+            _FakeKinetoEvent("setup", 500, 100),
+            _FakeKinetoEvent(
+                benchmark_base._KERNEL_REGION, 1_000, 1_000, annotation=True
+            ),
+            _FakeKinetoEvent("kernel_a", 1_100, 100),
+            _FakeKinetoEvent("kernel_b", 1_300, 200),
+            _FakeKinetoEvent(
+                benchmark_base._KERNEL_REGION, 3_000, 1_000, annotation=True
+            ),
+            _FakeKinetoEvent("kernel_c", 3_100, 50),
+        ]
+    )
+
+    sums_us, spans_us = _kineto_activity_times_us(results)
+
+    assert sums_us == pytest.approx([0.3, 0.05])
+    assert spans_us == pytest.approx([0.4, 0.05])
+
+
+def test_direct_backend_uses_median_within_each_trial(monkeypatch):
+    measurements = iter(
+        [
+            SimpleNamespace(
+                samples_ms=[1.0, 2.0, 100.0],
+                expected_sequence=[("kernel",)],
+                boundary_margins_ns=[],
+                activity_sum_ms=[1.0, 2.0, 100.0],
+                activity_span_ms=[1.0, 2.0, 100.0],
+                activity_union_busy_ms=[1.0, 2.0, 100.0],
+                inter_activity_idle_ms=[0.0, 0.0, 0.0],
+                activity_overlap_ms=[0.0, 0.0, 0.0],
+                inter_activity_gap_ms=[0.0, 0.0, 0.0],
+                cuda_event_span_ms=[],
+            ),
+            SimpleNamespace(
+                samples_ms=[3.0, 4.0, 100.0],
+                expected_sequence=[("kernel",)],
+                boundary_margins_ns=[],
+                activity_sum_ms=[3.0, 4.0, 100.0],
+                activity_span_ms=[3.0, 4.0, 100.0],
+                activity_union_busy_ms=[3.0, 4.0, 100.0],
+                inter_activity_idle_ms=[0.0, 0.0, 0.0],
+                activity_overlap_ms=[0.0, 0.0, 0.0],
+                inter_activity_gap_ms=[0.0, 0.0, 0.0],
+                cuda_event_span_ms=[],
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        cupti_timing, "measure_direct_cupti", lambda *_args, **_kwargs: next(measurements)
+    )
+    monkeypatch.setattr(
+        cupti_timing,
+        "get_cupti_runtime_info",
+        lambda: cupti_timing.CuptiRuntimeInfo("/tmp/libcupti.so.12", 28),
+    )
+    monkeypatch.setattr(benchmark_base.torch.cuda, "synchronize", lambda: None)
+    cache = SimpleNamespace(zero_=lambda: None)
+
+    trial_values, raw_samples, _ = benchmark_base._bench_with_direct_cupti(
+        lambda _iteration: None, cache, n_repeat=3, n_trials=2
+    )
+
+    assert trial_values == [2.0, 4.0]
+    assert raw_samples == [1.0, 2.0, 100.0, 3.0, 4.0, 100.0]
 
 
 # ShapeDtypeWorkload protocol tests
@@ -260,6 +368,7 @@ def test_bench_kernel_uses_direct_cupti_backend_by_default(monkeypatch):
     assert latency == pytest.approx(0.011)
     assert _bench_meta.timing == "cupti-direct"
     assert _bench_meta.requested_timing == "cupti-direct"
+    assert _bench_meta.timing_metric == "activity-span"
     assert _bench_meta.raw_samples_ms == [0.010, 0.011, 0.012]
     assert _bench_meta.direct_boundary_margins_ns == []
     assert _bench_meta.direct_activity_sum_ms == []

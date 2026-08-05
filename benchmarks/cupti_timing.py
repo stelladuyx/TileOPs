@@ -15,11 +15,14 @@ activity matching can be unit-tested without a CUDA device or a Kineto trace.
 from __future__ import annotations
 
 import bisect
+import ctypes
+import importlib.metadata
 from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import partial
+from pathlib import Path
 from typing import Any, Literal
 
 import torch
@@ -35,6 +38,16 @@ class DirectCuptiUnavailableError(DirectCuptiError):
 
 class DirectCuptiTraceError(DirectCuptiError):
     """A CUPTI trace cannot be attributed to complete benchmark calls."""
+
+
+@dataclass(frozen=True)
+class CuptiRuntimeInfo:
+    library_path: str
+    api_version: int
+
+
+_CUPTI_C_LIBRARY: Any | None = None
+_CUPTI_RUNTIME_INFO: CuptiRuntimeInfo | None = None
 
 
 @dataclass(frozen=True)
@@ -109,6 +122,9 @@ class DirectCuptiMeasurement:
     # Legacy algebraic value: span - sum == idle - overlap.  It is an exact
     # idle gap only when the selected activities do not overlap.
     inter_activity_gap_ms: list[float]
+    # Optional same-execution control. CUDA events are inserted only by the
+    # validation tool; production activity-span measurements leave this empty.
+    cuda_event_span_ms: list[float]
     expected_sequence: list[tuple[str, int, int, int, str]]
     metric: str
     # Conservative guard bands around the complete selected GPU activity span.
@@ -118,8 +134,55 @@ class DirectCuptiMeasurement:
     boundary_margins_ns: list[tuple[int, int]]
 
 
+def _load_packaged_cupti_library() -> tuple[Any, CuptiRuntimeInfo]:
+    """Preload and verify the CUPTI C library shipped with the CUDA wheel."""
+    try:
+        distribution = importlib.metadata.distribution("nvidia-cuda-cupti-cu12")
+    except importlib.metadata.PackageNotFoundError as exc:
+        raise DirectCuptiUnavailableError(
+            "direct CUPTI timing requires nvidia-cuda-cupti-cu12"
+        ) from exc
+    library_path = Path(
+        distribution.locate_file("nvidia/cuda_cupti/lib/libcupti.so.12")
+    ).resolve()
+    if not library_path.is_file():
+        raise DirectCuptiUnavailableError(
+            f"packaged libcupti was not found at {library_path}"
+        )
+    try:
+        library = ctypes.CDLL(str(library_path), mode=ctypes.RTLD_GLOBAL)
+        get_version = library.cuptiGetVersion
+        get_version.argtypes = [ctypes.POINTER(ctypes.c_uint32)]
+        get_version.restype = ctypes.c_int
+        version = ctypes.c_uint32()
+        result = get_version(ctypes.byref(version))
+    except (AttributeError, OSError) as exc:
+        raise DirectCuptiUnavailableError(
+            f"failed to load packaged libcupti at {library_path}"
+        ) from exc
+    if result != 0:
+        raise DirectCuptiUnavailableError(
+            f"cuptiGetVersion failed with result {result} for {library_path}"
+        )
+    # CUDA 12.8 uses API 26; CUDA 12.9 uses API 27 and update 1 uses 28.
+    minimum_versions = {"12.8": 26, "12.9": 27}
+    torch_cuda = torch.version.cuda
+    minimum_version = minimum_versions.get(torch_cuda)
+    if minimum_version is not None and version.value < minimum_version:
+        raise DirectCuptiUnavailableError(
+            f"CUPTI API {version.value} from {library_path} is older than "
+            f"the minimum {minimum_version} for Torch CUDA {torch_cuda}"
+        )
+    return library, CuptiRuntimeInfo(
+        library_path=str(library_path), api_version=version.value
+    )
+
+
 def load_cupti_api() -> Any:
     """Load the optional SOL direct-CUPTI Python binding lazily."""
+    global _CUPTI_C_LIBRARY, _CUPTI_RUNTIME_INFO
+    if _CUPTI_C_LIBRARY is None:
+        _CUPTI_C_LIBRARY, _CUPTI_RUNTIME_INFO = _load_packaged_cupti_library()
     try:
         from cupti import cupti
     except (ImportError, OSError) as exc:
@@ -128,6 +191,14 @@ def load_cupti_api() -> Any:
             "and a compatible libcupti"
         ) from exc
     return cupti
+
+
+def get_cupti_runtime_info() -> CuptiRuntimeInfo:
+    """Return the verified C library selected by :func:`load_cupti_api`."""
+    if _CUPTI_RUNTIME_INFO is None:
+        load_cupti_api()
+    assert _CUPTI_RUNTIME_INFO is not None
+    return _CUPTI_RUNTIME_INFO
 
 
 def activity_sequence(
@@ -283,8 +354,9 @@ def measure_direct_cupti(
     prepare_iteration: Callable[[int], None],
     repeats: int,
     *,
-    metric: Literal["activity-sum", "activity-span"] = "activity-sum",
+    metric: Literal["activity-sum", "activity-span"] = "activity-span",
     cupti_api: Any | None = None,
+    validate_with_cuda_events: bool = False,
 ) -> DirectCuptiMeasurement:
     """Measure complete per-call GPU activity without Kineto projection.
 
@@ -302,6 +374,17 @@ def measure_direct_cupti(
         raise ValueError(f"unknown direct CUPTI metric: {metric!r}")
 
     api = cupti_api or load_cupti_api()
+    event_pairs = (
+        [
+            (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
+            for _ in range(repeats)
+        ]
+        if validate_with_cuda_events
+        else []
+    )
 
     # Discover the callable's activity sequence after cache/setup work drains.
     prepare_iteration(-1)
@@ -322,7 +405,11 @@ def measure_direct_cupti(
         for iteration in range(repeats):
             prepare_iteration(iteration)
             start = int(api.get_timestamp())
+            if validate_with_cuda_events:
+                event_pairs[iteration][0].record()
             run_iteration(iteration)
+            if validate_with_cuda_events:
+                event_pairs[iteration][1].record()
             torch.cuda.synchronize()
             end = int(api.get_timestamp())
             if end <= start:
@@ -344,6 +431,10 @@ def measure_direct_cupti(
     activity_overlap_ms: list[float] = []
     inter_activity_gap_ms: list[float] = []
     boundary_margins_ns: list[tuple[int, int]] = []
+    cuda_event_span_ms = [
+        start_event.elapsed_time(end_event)
+        for start_event, end_event in event_pairs
+    ]
     expected_counts = Counter(expected)
     for iteration, (start, end) in enumerate(timestamp_windows):
         left = bisect.bisect_left(starts, start)
@@ -386,6 +477,7 @@ def measure_direct_cupti(
         inter_activity_idle_ms=inter_activity_idle_ms,
         activity_overlap_ms=activity_overlap_ms,
         inter_activity_gap_ms=inter_activity_gap_ms,
+        cuda_event_span_ms=cuda_event_span_ms,
         expected_sequence=expected,
         metric=metric,
         boundary_margins_ns=boundary_margins_ns,

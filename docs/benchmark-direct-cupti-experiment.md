@@ -23,10 +23,15 @@ window.
 
 `TILEOPS_DIRECT_CUPTI_METRIC` controls how selected activities become latency:
 
-| Value           | Semantics                                                                  | Status       |
-| --------------- | -------------------------------------------------------------------------- | ------------ |
-| `activity-sum`  | Sum complete activity durations, matching legacy TileOps Kineto semantics  | Default      |
-| `activity-span` | First activity start to last activity end, matching upstream SOL-ExecBench | Experimental |
+| Value           | Semantics                                                                  | Status                |
+| --------------- | -------------------------------------------------------------------------- | --------------------- |
+| `activity-span` | First activity start to last activity end, matching upstream SOL-ExecBench | Default               |
+| `activity-sum`  | Sum complete activity durations, matching legacy TileOps Kineto semantics  | Validation/diagnostic |
+
+The scalar benchmark result uses `median-of-trial-medians`: every trial reduces
+its raw per-call spans with a median, then the benchmark reports the median of
+nine trials. Raw samples and gap-tail diagnostics remain available; the
+reduction does not convert a span into an activity sum.
 
 ## Isolated environment
 
@@ -45,15 +50,16 @@ stack from `flashmlaenv` read-only but receives its own writes:
 
 Why `--no-deps`: the CUDA 12.9 runner's PyTorch requires
 `cuda-bindings==12.9.4`, while `cupti-python==12.8.0` declares
-`cuda-bindings==12.8.0`. The CUPTI extension and `get_timestamp()` work with
-the runner's 12.9 binding/library, but installing dependency closure would
-downgrade the binding required by PyTorch. This is an experiment constraint,
-not yet a production dependency decision.
+`cuda-bindings==12.8.0`. Installing dependency closure would downgrade the
+binding required by PyTorch. The loader explicitly preloads the CUDA 12.9
+`nvidia-cuda-cupti-cu12` wheel's `libcupti.so.12`, checks its API version, and
+records both in every direct result. On this runner it selects CUPTI API 28;
+the stale CUDA 12.4/API 22 library under `targets/` is rejected.
 
 ## Unit and GPU integration tests
 
 ```bash
-cd /home/yuxian.du/TileOPs-sol-cupti
+cd /home/yuxian.du/TileOPs
 
 /home/yuxian.du/.venvs/flashmla-sol-cupti/bin/python -m pytest -q \
   benchmarks/tests/test_cupti_timing.py \
@@ -70,7 +76,7 @@ The first command needs no GPU. The Nightly-marked test requires CUDA and
 ## Controlled stability experiment
 
 All implementation backends routed through `BenchmarkBase.profile()` share the
-same timing backend. To force direct CUPTI activity-sum across the complete
+same timing backend. To force direct CUPTI activity-span across the complete
 benchmark suite, including every isolated pytest child, run:
 
 ```bash
@@ -78,7 +84,7 @@ benchmark suite, including every isolated pytest child, run:
   scripts/ci/run_benchmarks.py benchmarks/ops \
   --junit-xml bench_results.xml \
   --timing-backend cupti-direct \
-  --direct-metric activity-sum \
+  --direct-metric activity-span \
   --fail-on-timing-fallback
 ```
 
@@ -90,15 +96,15 @@ they select compiled configurations and do not produce benchmark report data.
 Run the three-backend matrix on the H200 Nightly runner:
 
 ```bash
-cd /home/yuxian.du/TileOPs-sol-cupti
+cd /home/yuxian.du/TileOPs
 
 /home/yuxian.du/.venvs/flashmla-sol-cupti/bin/python \
   benchmarks/tools/timing_stability.py \
   --rounds 10 \
   --warmup 10 \
-  --repeats 50 \
-  --trials 3 \
-  --direct-metric activity-sum \
+  --repeats 100 \
+  --trials 9 \
+  --direct-metric activity-span \
   --max-cv 0.05 \
   --max-drift 0.05 \
   --max-direct-kineto-delta 0.10 \
@@ -110,18 +116,39 @@ cd /home/yuxian.du/TileOPs-sol-cupti
 The tool rotates backend order between rounds, disables fallback, and retains:
 
 - every reported latency and direct/CUDA-event raw sample;
-- per-trial means and within-measurement CV;
+- per-trial median reductions and within-measurement raw CV;
 - direct-CUPTI discovery activity sequence;
 - attribution failures without converting them to another backend;
 - round-level CV and first-half/second-half drift.
+
+Run correctness validation separately because CUDA-event markers perturb the
+span distribution:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 taskset -c 2 \
+/home/yuxian.du/.venvs/flashmla-sol-cupti/bin/python \
+  benchmarks/tools/timing_stability.py \
+  --rounds 5 --warmup 10 --repeats 100 --trials 3 \
+  --direct-metric activity-span \
+  --validate-with-cuda-events \
+  --max-cv 1 --max-drift 1 \
+  --output timing_span_correctness_gpu1_cpu2.json
+```
+
+The normal stability run omits `--validate-with-cuda-events`; production
+benchmarks never insert timing events into the direct-CUPTI path.
 
 Initial acceptance criteria:
 
 1. Direct CUPTI attribution success is `100%` for all three synthetic cases.
 1. Round-level CV is at most `5%` with locked clocks.
 1. First-half versus second-half median drift is at most `5%`.
-1. For single-kernel cases, direct CUPTI and successful Kineto medians differ by
-   at most `10%`.
+1. Direct CUPTI activity-sum and Kineto activity-sum medians differ by at most
+   `10%`; this validates independent activity attribution and durations.
+1. In explicit `--validate-with-cuda-events` runs, every direct activity span
+   remains inside the CUDA events enclosing that exact execution. Event elapsed
+   is an upper bound, not an equality oracle, because it also includes the
+   pre-first and post-last activity gaps.
 1. CUDA-events results are reported only as an error-size comparison and never
    mixed into performance history.
 
@@ -131,7 +158,7 @@ Measured on 2026-08-05 with an NVIDIA H200, driver 575.57.08, locked 1500 MHz
 SM clock, Torch `2.11.0.dev20260107+cu129`, 10 rounds, 10 warmups, 50 repeats,
 and 3 trials. All direct measurements completed without fallback.
 
-### Accepted: direct CUPTI `activity-sum`
+### Historical control: direct CUPTI `activity-sum`
 
 | Case                 | Direct median | Direct round CV | Half-run ratio | Kineto median | Direct / Kineto | CUDA Events median |
 | -------------------- | ------------: | --------------: | -------------: | ------------: | --------------: | -----------------: |
@@ -264,19 +291,50 @@ Reducing gap is therefore a valid end-to-end tuning direction for repeated,
 short multi-kernel workflows. Kernel fusion, CUDA Graph replay, native/batched
 launch, persistent kernels, removing host round trips, and eliminating
 unnecessary stream/event waits are candidate techniques. It should remain a
-separate objective from kernel-body tuning: per-kernel implementation history
-uses activity-sum, while application/workflow latency can use activity-span and
-idle-gap diagnostics.
+separate objective from kernel-body tuning. Current performance history uses
+activity-span by policy; the retained activity-sum, union-busy, idle P90/max,
+and overlap diagnostics explain whether a regression came from kernel bodies or
+from the launch/dependency pipeline.
 
-### Rejected as default: upstream `activity-span`
+### Activity-span sampling policy and residual risk
 
 The same 10-round experiment with upstream SOL-ExecBench span semantics was
 stable for both single-kernel cases, but the fast multi-kernel case measured
 12.701 us versus Kineto's 3.685 us, had 8.49% round CV, and drifted 9.4% between
-the first and second halves. The span includes GPU idle gaps while the host
-launches the next short kernel. It remains useful as an end-to-end GPU-span
-diagnostic but is not a stable replacement for TileOps' historical pure
-activity-duration metric.
+the first and second halves under the earlier three-trial/mean reduction. The
+span includes GPU idle gaps while the host launches the next short kernel.
+
+The selected policy accepts that semantic and controls its long tail with nine
+trials and `median-of-trial-medians`. On locked GPU1, pinned to CPU2, a
+10-round/100-repeat/9-trial run passed: the fast two-kernel case reported a
+10.552 us median, 2.96% round CV, and 1.021 half-run ratio. Three-trial runs
+still produced 6.9% to 12.3% round CV, so reducing the default back to three is
+unsafe for short eager multi-kernel calls. The raw idle gap remains variable
+(7.008 us median, 134.047 us maximum) and must stay visible in diagnostics.
+
+## Direct-CUPTI correctness validation
+
+The final validation uses complementary checks rather than treating a separate
+Kineto span as an exact oracle:
+
+1. Direct activity-sum is compared with an independently captured Kineto
+   activity-sum. Across the final three synthetic cases, median ratios were
+   0.999x to 1.001x in the correctness run.
+2. Optional CUDA events enclose the exact same direct-CUPTI execution. All
+   4,500 checked samples remained inside their event enclosure. The event
+   elapsed value is intentionally not compared for equality because it also
+   contains roughly 12--18 us of boundary dispatch gap on this runner.
+3. Every timed window must contain the complete discovery activity multiset;
+   incomplete or changed sequences fail closed. The final run had no misses and
+   no sample below the 2 us CPU/GPU timestamp guard.
+4. Unit tests independently exercise span, sum, union busy, idle, overlap, and
+   incomplete-sequence rejection.
+
+The same run records the selected C library as
+`nvidia/cuda_cupti/lib/libcupti.so.12`, CUPTI API 28. Kineto span remains in the
+report as a perturbation diagnostic. It matches single-kernel spans but is
+larger for eager multi-kernel calls because Kineto changes the host launch gap;
+therefore it is not an acceptance gate.
 
 ## Nightly-like workload matrix
 
@@ -291,14 +349,17 @@ After the synthetic matrix passes, run selected real cases with
 - `n_repeat = 1`, `10`, and `50`;
 - isolated pytest process and normal Nightly file order.
 
-For formal history comparison, persist `timing`, `timing_requested`, fallback
-reason, sample count, CV, and trial means. The branch exposes these diagnostics
+For formal history comparison, persist `timing`, `timing_requested`, metric,
+reduction, CUPTI library/API, fallback reason, sample count, CV, and trial
+reductions. The branch exposes these diagnostics
 when `TILEOPS_RECORD_TIMING_DIAGNOSTICS=1`.
 
 ## Known risks to validate
 
-- `cupti-python` currently has no 12.9 release; 12.8/12.9 ABI compatibility is
-  demonstrated only for import/API access until the H200 run completes.
+- `cupti-python` currently has no 12.9 release. The 12.8 Python wrapper is used
+  with CUDA bindings 12.9.4 and explicitly preloaded CUPTI API 28; this passed
+  unit, GPU correctness, and repeated stability tests but remains an explicit
+  compatibility dependency to revisit when a matching wrapper ships.
 - Direct CUPTI tracing repeatedly enables, flushes, disables, and finalizes
   activity collection. Long-process stability must be tested, not inferred from
   one successful call.
@@ -309,3 +370,7 @@ when `TILEOPS_RECORD_TIMING_DIAGNOSTICS=1`.
   `activity-sum` can double-count overlapping activities, while
   `activity-span` includes inter-activity gaps; real multi-stream workloads must
   therefore be checked separately before formal Nightly adoption.
+- Short eager multi-kernel spans require nine trials and robust median
+  reduction. The gap distribution still has a long tail, so raw P90/max and
+  round CV must be retained rather than treating a passing scalar as proof that
+  launch-pipeline latency is invariant.

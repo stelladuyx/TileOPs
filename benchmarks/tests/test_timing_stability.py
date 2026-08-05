@@ -6,7 +6,7 @@ from benchmarks.tools.timing_stability import _acceptance_failures, _aggregate
 
 
 def _measurement(case, backend, round_index, latency):
-    return {
+    measurement = {
         "case": case,
         "backend": backend,
         "round": round_index,
@@ -14,6 +14,10 @@ def _measurement(case, backend, round_index, latency):
         "latency_ms": latency,
         "raw_samples_ms": [latency],
     }
+    if backend == "cupti-direct":
+        measurement["direct_activity_span_ms"] = [latency]
+        measurement["direct_cuda_event_span_ms"] = [latency]
+    return measurement
 
 
 def test_acceptance_detects_direct_instability_and_backend_bias():
@@ -32,6 +36,8 @@ def test_acceptance_detects_direct_instability_and_backend_bias():
         max_cv=0.05,
         max_drift=0.05,
         max_direct_kineto_delta=0.05,
+        max_event_containment_error_us=2.0,
+        validate_with_cuda_events=True,
         clock_shift_risk_us=2.0,
     )
 
@@ -58,10 +64,62 @@ def test_acceptance_passes_stable_matching_measurements():
         max_cv=0.05,
         max_drift=0.05,
         max_direct_kineto_delta=0.05,
+        max_event_containment_error_us=2.0,
+        validate_with_cuda_events=True,
         clock_shift_risk_us=2.0,
     )
 
     assert _acceptance_failures(aggregate, args) == []
+
+
+def test_acceptance_skips_event_control_for_uninstrumented_stability_run():
+    measurements = []
+    for backend in ("cupti-direct", "kineto", "cuda-events"):
+        item = _measurement("case", backend, 0, 1.0)
+        item.pop("direct_cuda_event_span_ms", None)
+        measurements.append(item)
+    aggregate = _aggregate(measurements, ["case"], rounds=1)
+    args = SimpleNamespace(
+        max_failure_rate=0.0,
+        max_cv=0.05,
+        max_drift=0.05,
+        max_direct_kineto_delta=0.05,
+        max_event_containment_error_us=2.0,
+        validate_with_cuda_events=False,
+        clock_shift_risk_us=2.0,
+    )
+
+    assert _acceptance_failures(aggregate, args) == []
+
+
+def test_acceptance_validates_span_against_same_capture_event_control():
+    measurements = []
+    for round_index in range(4):
+        direct = _measurement("case", "cupti-direct", round_index, 2.0)
+        direct["direct_activity_sum_ms"] = [1.0]
+        direct["direct_activity_span_ms"] = [2.0]
+        direct["direct_cuda_event_span_ms"] = [1.997]
+        kineto = _measurement("case", "kineto", round_index, 1.5)
+        kineto["kineto_activity_sum_ms"] = [1.0]
+        kineto["kineto_activity_span_ms"] = [1.5]
+        measurements.extend(
+            [direct, kineto, _measurement("case", "cuda-events", round_index, 2.0)]
+        )
+    aggregate = _aggregate(measurements, ["case"], rounds=4)
+    args = SimpleNamespace(
+        max_failure_rate=0.0,
+        max_cv=0.05,
+        max_drift=0.05,
+        max_direct_kineto_delta=0.05,
+        max_event_containment_error_us=2.0,
+        validate_with_cuda_events=True,
+        clock_shift_risk_us=2.0,
+    )
+
+    failures = _acceptance_failures(aggregate, args)
+
+    assert not any("direct-sum/Kineto" in failure for failure in failures)
+    assert any("CUDA-event enclosure" in failure for failure in failures)
 
 
 def test_acceptance_detects_clock_shift_boundary_risk():
@@ -77,6 +135,8 @@ def test_acceptance_detects_clock_shift_boundary_risk():
         max_cv=0.05,
         max_drift=0.05,
         max_direct_kineto_delta=0.05,
+        max_event_containment_error_us=2.0,
+        validate_with_cuda_events=True,
         clock_shift_risk_us=2.0,
     )
 

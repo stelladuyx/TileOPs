@@ -22,7 +22,7 @@ from typing import Any
 import torch
 
 from benchmarks.benchmark_base import _bench_meta, bench_kernel
-from benchmarks.cupti_timing import load_cupti_api
+from benchmarks.cupti_timing import get_cupti_runtime_info, load_cupti_api
 
 BACKENDS = ("cupti-direct", "kineto", "cuda-events")
 
@@ -134,6 +134,9 @@ def _measurement(
     os.environ["TILEOPS_TIMING_BACKEND"] = backend
     os.environ["TILEOPS_ALLOW_CUDA_EVENTS_FALLBACK"] = "0"
     os.environ["TILEOPS_DIRECT_CUPTI_METRIC"] = args.direct_metric
+    os.environ["TILEOPS_VALIDATE_CUPTI_WITH_CUDA_EVENTS"] = (
+        "1" if backend == "cupti-direct" and args.validate_with_cuda_events else "0"
+    )
     try:
         latency = bench_kernel(
             fn,
@@ -159,7 +162,10 @@ def _measurement(
         "status": "ok",
         "latency_ms": latency,
         "raw_samples_ms": list(getattr(_bench_meta, "raw_samples_ms", [])),
-        "trial_means_ms": list(getattr(_bench_meta, "trial_means_ms", [])),
+        "trial_reductions_ms": list(
+            getattr(_bench_meta, "trial_reductions_ms", [])
+        ),
+        "timing_reduction": getattr(_bench_meta, "timing_reduction", None),
         "within_measurement_cv": getattr(_bench_meta, "timing_cv", None),
         "activity_sequence": list(
             getattr(_bench_meta, "expected_activity_sequence", [])
@@ -185,6 +191,17 @@ def _measurement(
         "direct_inter_activity_gap_ms": list(
             getattr(_bench_meta, "direct_inter_activity_gap_ms", [])
         ),
+        "direct_cuda_event_span_ms": list(
+            getattr(_bench_meta, "direct_cuda_event_span_ms", [])
+        ),
+        "kineto_activity_sum_ms": list(
+            getattr(_bench_meta, "kineto_activity_sum_ms", [])
+        ),
+        "kineto_activity_span_ms": list(
+            getattr(_bench_meta, "kineto_activity_span_ms", [])
+        ),
+        "cupti_library_path": getattr(_bench_meta, "cupti_library_path", None),
+        "cupti_api_version": getattr(_bench_meta, "cupti_api_version", None),
     }
 
 
@@ -248,6 +265,21 @@ def _aggregate(
                 for item in successful
                 for sample in item.get("direct_activity_overlap_ms", [])
             ]
+            cuda_event_spans = [
+                sample
+                for item in successful
+                for sample in item.get("direct_cuda_event_span_ms", [])
+            ]
+            event_enclosure_margins = [
+                event_span - activity_span
+                for item in successful
+                if item.get("direct_cuda_event_span_ms")
+                for event_span, activity_span in zip(
+                    item.get("direct_cuda_event_span_ms", []),
+                    item.get("direct_activity_span_ms", []),
+                    strict=True,
+                )
+            ]
             round_activity_sums = [
                 statistics.mean(item["direct_activity_sum_ms"])
                 for item in successful
@@ -262,6 +294,26 @@ def _aggregate(
                 statistics.mean(item["direct_inter_activity_gap_ms"])
                 for item in successful
                 if item.get("direct_inter_activity_gap_ms")
+            ]
+            kineto_activity_sums = [
+                sample
+                for item in successful
+                for sample in item.get("kineto_activity_sum_ms", [])
+            ]
+            kineto_activity_spans = [
+                sample
+                for item in successful
+                for sample in item.get("kineto_activity_span_ms", [])
+            ]
+            round_kineto_activity_sums = [
+                statistics.mean(item["kineto_activity_sum_ms"])
+                for item in successful
+                if item.get("kineto_activity_sum_ms")
+            ]
+            round_kineto_activity_spans = [
+                statistics.mean(item["kineto_activity_span_ms"])
+                for item in successful
+                if item.get("kineto_activity_span_ms")
             ]
             first_half = latencies[: max(1, len(latencies) // 2)]
             second_half = latencies[len(latencies) // 2 :]
@@ -281,11 +333,23 @@ def _aggregate(
                 "direct_activity_union_busy_ms": _summary(activity_union_busy),
                 "direct_inter_activity_idle_ms": _summary(inter_activity_idle),
                 "direct_activity_overlap_ms": _summary(activity_overlap),
+                "direct_cuda_event_span_ms": _summary(cuda_event_spans),
+                "direct_cuda_event_enclosure_margin_ms": _summary(
+                    event_enclosure_margins
+                ),
                 "direct_inter_activity_gap_ms": _summary(inter_activity_gaps),
                 "round_direct_activity_sum_ms": _summary(round_activity_sums),
                 "round_direct_activity_span_ms": _summary(round_activity_spans),
                 "round_direct_inter_activity_gap_ms": _summary(
                     round_inter_activity_gaps
+                ),
+                "kineto_activity_sum_ms": _summary(kineto_activity_sums),
+                "kineto_activity_span_ms": _summary(kineto_activity_spans),
+                "round_kineto_activity_sum_ms": _summary(
+                    round_kineto_activity_sums
+                ),
+                "round_kineto_activity_span_ms": _summary(
+                    round_kineto_activity_spans
                 ),
                 "clock_shift_unsafe_samples": sum(
                     left < clock_shift_risk_us * 1_000
@@ -324,22 +388,39 @@ def _acceptance_failures(aggregate: dict[str, Any], args: argparse.Namespace) ->
                 f"{case_name}: direct CUPTI half-run drift {drift:.3f} exceeds "
                 f"±{args.max_drift:.1%}"
             )
-        # Kineto reports the sum of projected activity durations.  Even when
-        # the requested direct metric is activity-span, compare Kineto against
-        # the activity-sum control derived from the exact same CUPTI capture.
+        # Validate direct attribution/durations against Kineto independently;
+        # validate span enclosure from the same direct capture below.
         direct_sum_median = direct["round_direct_activity_sum_ms"]["median"]
-        direct_median = (
+        direct_sum_median = (
             direct_sum_median
             if direct_sum_median is not None
             else direct["round_latency_ms"]["median"]
         )
-        kineto_median = backends["kineto"]["round_latency_ms"]["median"]
-        if direct_median is not None and kineto_median is not None:
-            ratio = direct_median / kineto_median
+        kineto = backends["kineto"]
+        kineto_sum_median = kineto["round_kineto_activity_sum_ms"]["median"]
+        kineto_sum_median = (
+            kineto_sum_median
+            if kineto_sum_median is not None
+            else kineto["round_latency_ms"]["median"]
+        )
+        if direct_sum_median is not None and kineto_sum_median is not None:
+            ratio = direct_sum_median / kineto_sum_median
             if abs(ratio - 1.0) > args.max_direct_kineto_delta:
                 failures.append(
                     f"{case_name}: direct-sum/Kineto median ratio {ratio:.3f} exceeds "
                     f"±{args.max_direct_kineto_delta:.1%}"
+                )
+        # Span is sensitive to instrumentation-induced host launch gaps, so a
+        # separate Kineto capture is not a valid oracle. Compare against CUDA
+        # events inserted around the exact same execution instead.
+        if args.validate_with_cuda_events:
+            event_margin = direct["direct_cuda_event_enclosure_margin_ms"]
+            if event_margin["count"] == 0:
+                failures.append(f"{case_name}: no same-capture CUDA-event span control")
+            elif event_margin["min"] < -args.max_event_containment_error_us * 1e-3:
+                failures.append(
+                    f"{case_name}: CUPTI activity span exceeds its same-capture "
+                    f"CUDA-event enclosure by {-event_margin['min'] * 1e3:.3f} us"
                 )
     return failures
 
@@ -350,11 +431,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rounds", type=int, default=10)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeats", type=int, default=50)
-    parser.add_argument("--trials", type=int, default=3)
+    parser.add_argument("--trials", type=int, default=9)
     parser.add_argument("--max-cv", type=float, default=0.05)
     parser.add_argument("--max-drift", type=float, default=0.05)
     parser.add_argument("--max-failure-rate", type=float, default=0.0)
     parser.add_argument("--max-direct-kineto-delta", type=float, default=0.10)
+    parser.add_argument(
+        "--max-event-containment-error-us", type=float, default=2.0
+    )
+    parser.add_argument(
+        "--validate-with-cuda-events",
+        action="store_true",
+        help="insert enclosing events for a correctness run; perturbs timing",
+    )
     parser.add_argument(
         "--clock-shift-risk-us",
         type=float,
@@ -364,7 +453,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--direct-metric",
         choices=("activity-sum", "activity-span"),
-        default="activity-sum",
+        default="activity-span",
     )
     parser.add_argument(
         "--output", type=Path, default=Path("timing_stability.json")
@@ -383,6 +472,7 @@ def main() -> int:
     # Fail before running a long experiment if the isolated environment is not
     # actually capable of loading the direct CUPTI API.
     load_cupti_api().get_timestamp()
+    cupti_runtime = get_cupti_runtime_info()
     cases = _cases(
         args.device,
         include_tileops_l2=args.include_tileops_l2,
@@ -392,6 +482,7 @@ def main() -> int:
     old_backend = os.environ.get("TILEOPS_TIMING_BACKEND")
     old_fallback = os.environ.get("TILEOPS_ALLOW_CUDA_EVENTS_FALLBACK")
     old_direct_metric = os.environ.get("TILEOPS_DIRECT_CUPTI_METRIC")
+    old_event_validation = os.environ.get("TILEOPS_VALIDATE_CUPTI_WITH_CUDA_EVENTS")
     try:
         for round_index in range(args.rounds):
             # Rotate backend order to reduce temperature/order bias.
@@ -424,6 +515,10 @@ def main() -> int:
             os.environ.pop("TILEOPS_DIRECT_CUPTI_METRIC", None)
         else:
             os.environ["TILEOPS_DIRECT_CUPTI_METRIC"] = old_direct_metric
+        if old_event_validation is None:
+            os.environ.pop("TILEOPS_VALIDATE_CUPTI_WITH_CUDA_EVENTS", None)
+        else:
+            os.environ["TILEOPS_VALIDATE_CUPTI_WITH_CUDA_EVENTS"] = old_event_validation
 
     aggregate = _aggregate(
         measurements, list(cases), args.rounds, args.clock_shift_risk_us
@@ -438,6 +533,8 @@ def main() -> int:
             "torch_cuda": torch.version.cuda,
             "device": args.device,
             "gpu": torch.cuda.get_device_name(args.device),
+            "cupti_library_path": cupti_runtime.library_path,
+            "cupti_api_version": cupti_runtime.api_version,
         },
         "config": vars(args) | {"output": str(args.output)},
         "measurements": measurements,

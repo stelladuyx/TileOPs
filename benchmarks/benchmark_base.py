@@ -104,8 +104,8 @@ class _CuptiProjectionError(Exception):
 _KERNEL_REGION = "tileops_bench_kernel"
 
 
-def _sum_kernel_time_us(kineto_results):
-    """Sum device time of the kernels the timed call launched.
+def _kineto_activity_times_us(kineto_results) -> tuple[list[float], list[float]]:
+    """Return per-region activity sums and spans from one Kineto trace.
 
     Sums only kernels inside a :data:`_KERNEL_REGION` annotation window, so the
     L2-flush fill is excluded and the kernel under test is counted regardless of
@@ -114,10 +114,10 @@ def _sum_kernel_time_us(kineto_results):
     Iterates the C++ Kineto events directly to bypass ``key_averages()``, which
     is ~16x slower (~130ms of Python parsing/tree-building) for large traces.
 
-    Returns:
-        ``(total_us, n_regions)``: summed kernel time in microseconds and the
-        number of annotation windows. The caller checks ``n_regions ==
-        n_repeat`` to confirm the scope projected on every iteration.
+    For every projected :data:`_KERNEL_REGION`, the sum is the total duration
+    of its CUDA activities and the span is the first activity start through
+    the last activity end. Deriving both from the same trace lets direct CUPTI
+    validate both metrics against an independent collector.
     """
     import bisect
 
@@ -135,14 +135,37 @@ def _sum_kernel_time_us(kineto_results):
     windows.sort()
     starts = [w[0] for w in windows]
     ends = [w[1] for w in windows]
-    total_us = 0.0
+    sums_ns = [0] * len(windows)
+    first_starts: list[int | None] = [None] * len(windows)
+    last_ends: list[int | None] = [None] * len(windows)
     for start_ns, dur_ns in kernels:
         # Count only kernels that fall inside a timed-call window; everything
         # outside (notably the L2-flush fill) is excluded.
         idx = bisect.bisect_right(starts, start_ns) - 1
         if idx >= 0 and start_ns < ends[idx]:
-            total_us += dur_ns / 1000.0
-    return total_us, len(windows)
+            end_ns = start_ns + dur_ns
+            sums_ns[idx] += dur_ns
+            first_starts[idx] = (
+                start_ns
+                if first_starts[idx] is None
+                else min(first_starts[idx], start_ns)
+            )
+            last_ends[idx] = (
+                end_ns if last_ends[idx] is None else max(last_ends[idx], end_ns)
+            )
+
+    sums_us = [duration / 1_000.0 for duration in sums_ns]
+    spans_us = [
+        0.0 if first is None or last is None else (last - first) / 1_000.0
+        for first, last in zip(first_starts, last_ends, strict=True)
+    ]
+    return sums_us, spans_us
+
+
+def _sum_kernel_time_us(kineto_results):
+    """Compatibility wrapper returning aggregate Kineto activity-sum."""
+    sums_us, _ = _kineto_activity_times_us(kineto_results)
+    return sum(sums_us), len(sums_us)
 
 
 # L2 cache flush buffer (sized to actual L2, allocated lazily)
@@ -185,6 +208,7 @@ def _native_output_suppressor():
 
 
 _TIMING_BACKENDS = frozenset({"cupti-direct", "kineto", "cuda-events"})
+_DEFAULT_DIRECT_CUPTI_METRIC = "activity-span"
 
 
 def _bench_with_direct_cupti(
@@ -194,10 +218,10 @@ def _bench_with_direct_cupti(
     n_trials: int,
 ) -> tuple[list[float], list[float], list[Any]]:
     """Run SOL-style direct CUPTI activity timing without Kineto."""
-    from benchmarks.cupti_timing import measure_direct_cupti
+    from benchmarks.cupti_timing import get_cupti_runtime_info, measure_direct_cupti
 
-    metric = os.getenv("TILEOPS_DIRECT_CUPTI_METRIC", "activity-sum")
-    trial_means: list[float] = []
+    metric = os.getenv("TILEOPS_DIRECT_CUPTI_METRIC", _DEFAULT_DIRECT_CUPTI_METRIC)
+    trial_reductions: list[float] = []
     raw_samples: list[float] = []
     expected_sequence: list[Any] = []
     boundary_margins_ns: list[tuple[int, int]] = []
@@ -207,6 +231,10 @@ def _bench_with_direct_cupti(
     inter_activity_idle_ms: list[float] = []
     activity_overlap_ms: list[float] = []
     inter_activity_gap_ms: list[float] = []
+    cuda_event_span_ms: list[float] = []
+    validate_with_cuda_events = (
+        os.getenv("TILEOPS_VALIDATE_CUPTI_WITH_CUDA_EVENTS", "0") == "1"
+    )
 
     def prepare_iteration(_iteration: int) -> None:
         cache.zero_()
@@ -219,6 +247,7 @@ def _bench_with_direct_cupti(
             prepare_iteration,
             n_repeat,
             metric=metric,
+            validate_with_cuda_events=validate_with_cuda_events,
         )
         if not expected_sequence:
             expected_sequence = measurement.expected_sequence
@@ -236,7 +265,8 @@ def _bench_with_direct_cupti(
         inter_activity_idle_ms.extend(measurement.inter_activity_idle_ms)
         activity_overlap_ms.extend(measurement.activity_overlap_ms)
         inter_activity_gap_ms.extend(measurement.inter_activity_gap_ms)
-        trial_means.append(statistics.mean(measurement.samples_ms))
+        cuda_event_span_ms.extend(measurement.cuda_event_span_ms)
+        trial_reductions.append(statistics.median(measurement.samples_ms))
     _bench_meta.direct_boundary_margins_ns = boundary_margins_ns
     _bench_meta.direct_activity_sum_ms = activity_sum_ms
     _bench_meta.direct_activity_span_ms = activity_span_ms
@@ -244,7 +274,11 @@ def _bench_with_direct_cupti(
     _bench_meta.direct_inter_activity_idle_ms = inter_activity_idle_ms
     _bench_meta.direct_activity_overlap_ms = activity_overlap_ms
     _bench_meta.direct_inter_activity_gap_ms = inter_activity_gap_ms
-    return trial_means, raw_samples, expected_sequence
+    _bench_meta.direct_cuda_event_span_ms = cuda_event_span_ms
+    runtime_info = get_cupti_runtime_info()
+    _bench_meta.cupti_library_path = runtime_info.library_path
+    _bench_meta.cupti_api_version = runtime_info.api_version
+    return trial_reductions, raw_samples, expected_sequence
 
 
 def _bench_with_kineto(
@@ -253,8 +287,17 @@ def _bench_with_kineto(
     n_repeat: int,
     n_trials: int,
 ) -> tuple[list[float], list[float], list[Any]]:
-    """Run the legacy torch.profiler/Kineto projection timing path."""
-    trial_means: list[float] = []
+    """Run Kineto and retain independent activity-sum and span controls."""
+    metric = os.getenv("TILEOPS_DIRECT_CUPTI_METRIC", _DEFAULT_DIRECT_CUPTI_METRIC)
+    if metric not in ("activity-sum", "activity-span"):
+        raise ValueError(
+            f"unknown TILEOPS_DIRECT_CUPTI_METRIC={metric!r}; "
+            "expected 'activity-sum' or 'activity-span'"
+        )
+    trial_reductions: list[float] = []
+    raw_samples: list[float] = []
+    activity_sum_ms: list[float] = []
+    activity_span_ms: list[float] = []
     for _ in range(n_trials):
         with torch.profiler.profile(
             activities=[
@@ -268,7 +311,10 @@ def _bench_with_kineto(
                 with torch.profiler.record_function(_KERNEL_REGION):
                     run_iteration(iteration)
                 torch.cuda.synchronize()
-        total_us, n_regions = _sum_kernel_time_us(profiler.profiler.kineto_results)
+        sums_us, spans_us = _kineto_activity_times_us(
+            profiler.profiler.kineto_results
+        )
+        n_regions = len(sums_us)
         if n_regions != n_repeat:
             n_cuda_kernels = sum(
                 1
@@ -279,9 +325,21 @@ def _bench_with_kineto(
                 f"{n_regions}/{n_repeat} annotation windows projected, "
                 f"{n_cuda_kernels} CUDA kernels captured"
             )
-        trial_means.append((total_us / n_repeat) * 1e-3)
-    # Kineto exposes only the per-trial aggregate through this optimized parser.
-    return trial_means, list(trial_means), []
+        if any(span <= 0 for span in spans_us):
+            raise _CuptiProjectionError(
+                "Kineto projection incomplete: at least one timed annotation "
+                "window contains no CUDA activity"
+            )
+        sums_ms = [sample * 1e-3 for sample in sums_us]
+        spans_ms = [sample * 1e-3 for sample in spans_us]
+        activity_sum_ms.extend(sums_ms)
+        activity_span_ms.extend(spans_ms)
+        selected = sums_ms if metric == "activity-sum" else spans_ms
+        raw_samples.extend(selected)
+        trial_reductions.append(statistics.median(selected))
+    _bench_meta.kineto_activity_sum_ms = activity_sum_ms
+    _bench_meta.kineto_activity_span_ms = activity_span_ms
+    return trial_reductions, raw_samples, []
 
 
 def _bench_with_cuda_events(
@@ -291,7 +349,7 @@ def _bench_with_cuda_events(
     n_trials: int,
 ) -> tuple[list[float], list[float], list[Any]]:
     """Run the diagnostic CUDA-events fallback and retain raw samples."""
-    trial_means: list[float] = []
+    trial_reductions: list[float] = []
     raw_samples: list[float] = []
     for _ in range(n_trials):
         start_events = [torch.cuda.Event(enable_timing=True) for _ in range(n_repeat)]
@@ -310,8 +368,8 @@ def _bench_with_cuda_events(
             for start, end in zip(start_events, end_events, strict=True)
         ]
         raw_samples.extend(samples)
-        trial_means.append(statistics.mean(samples))
-    return trial_means, raw_samples, []
+        trial_reductions.append(statistics.median(samples))
+    return trial_reductions, raw_samples, []
 
 
 # NVIDIA SOL-ExecBench–style benchmark
@@ -321,7 +379,7 @@ def bench_kernel(
     args: tuple[Any, ...] = (),
     n_warmup: int = 10,
     n_repeat: int = 50,
-    n_trials: int = 3,
+    n_trials: int = 9,
 ) -> float:
     """Benchmark a GPU callable with selectable GPU timing backends.
 
@@ -332,7 +390,8 @@ def bench_kernel(
          with direct CUPTI activity timing (no Kineto projection).
          L2 is flushed before every iteration.  Input tensors are cloned
          each iteration so the kernel always sees fresh addresses.
-      4. Report the median trial mean (robust to outlier trials).
+      4. Take the median sample in each trial, then report the median trial
+         reduction (robust to long-tail host scheduling gaps).
 
     The default ``cupti-direct`` backend is adapted from NVIDIA SOL-ExecBench:
     it discovers the callable's GPU activity sequence, records per-iteration
@@ -347,7 +406,8 @@ def bench_kernel(
             values are passed through unchanged.
         n_warmup: Warmup iterations (default 10).
         n_repeat: Timed iterations per trial (default 50).
-        n_trials: Independent trials (default 3).
+        n_trials: Independent trials (default 9). Nine trials are required for
+            stable median activity-span reduction on short multi-kernel calls.
 
     Returns:
         Kernel latency in **milliseconds**.
@@ -415,6 +475,11 @@ def bench_kernel(
         _bench_meta.direct_inter_activity_idle_ms = []
         _bench_meta.direct_activity_overlap_ms = []
         _bench_meta.direct_inter_activity_gap_ms = []
+        _bench_meta.direct_cuda_event_span_ms = []
+        _bench_meta.kineto_activity_sum_ms = []
+        _bench_meta.kineto_activity_span_ms = []
+        _bench_meta.cupti_library_path = None
+        _bench_meta.cupti_api_version = None
         # Warmup is deliberately outside all profiler/activity contexts.
         for iteration in range(n_warmup):
             cache.zero_()
@@ -424,15 +489,15 @@ def bench_kernel(
         try:
             with _native_output_suppressor():
                 if backend == "cupti-direct":
-                    trial_means, raw_samples, expected_sequence = _bench_with_direct_cupti(
+                    trial_reductions, raw_samples, expected_sequence = _bench_with_direct_cupti(
                         _run, cache, n_repeat, n_trials
                     )
                 elif backend == "kineto":
-                    trial_means, raw_samples, expected_sequence = _bench_with_kineto(
+                    trial_reductions, raw_samples, expected_sequence = _bench_with_kineto(
                         _run, cache, n_repeat, n_trials
                     )
                 else:
-                    trial_means, raw_samples, expected_sequence = _bench_with_cuda_events(
+                    trial_reductions, raw_samples, expected_sequence = _bench_with_cuda_events(
                         _run, cache, n_repeat, n_trials
                     )
             actual_backend = backend
@@ -467,7 +532,7 @@ def bench_kernel(
                 backend,
                 measurement_error,
             )
-            trial_means, raw_samples, expected_sequence = _bench_with_cuda_events(
+            trial_reductions, raw_samples, expected_sequence = _bench_with_cuda_events(
                 _run, cache, n_repeat, n_trials
             )
             actual_backend = "cuda-events"
@@ -476,12 +541,13 @@ def bench_kernel(
         _bench_meta.timing = actual_backend
         _bench_meta.requested_timing = backend
         _bench_meta.raw_samples_ms = list(raw_samples)
-        _bench_meta.trial_means_ms = list(trial_means)
+        _bench_meta.trial_reductions_ms = list(trial_reductions)
+        _bench_meta.timing_reduction = "median-of-trial-medians"
         _bench_meta.expected_activity_sequence = list(expected_sequence)
         _bench_meta.timing_metric = (
-            os.getenv("TILEOPS_DIRECT_CUPTI_METRIC", "activity-sum")
-            if actual_backend == "cupti-direct"
-            else "trial-mean" if actual_backend == "kineto" else "event-elapsed"
+            os.getenv("TILEOPS_DIRECT_CUPTI_METRIC", _DEFAULT_DIRECT_CUPTI_METRIC)
+            if actual_backend in ("cupti-direct", "kineto")
+            else "event-elapsed"
         )
         _bench_meta.fallback_reason = fallback_reason
         if raw_samples and statistics.mean(raw_samples) > 0:
@@ -489,8 +555,8 @@ def bench_kernel(
         else:
             _bench_meta.timing_cv = 0.0
 
-        trial_means.sort()
-        return trial_means[len(trial_means) // 2]
+        trial_reductions.sort()
+        return trial_reductions[len(trial_reductions) // 2]
     finally:
         # Release clone storage even when profiling or the callable fails.
         if arg_pool is not None:
@@ -577,7 +643,7 @@ class BenchmarkBase(Generic[W], ABC):
         """Profile a callable and return structured results.
 
         Uses the NVIDIA SOL-ExecBench protocol: CUPTI kernel timing,
-        10 warmup, 50 repeats × 3 trials, L2 flush sized to actual
+        10 warmup, 50 repeats × 9 trials, L2 flush sized to actual
         cache, input tensors cloned each iteration.
         """
         with torch.no_grad():
@@ -607,14 +673,45 @@ class BenchmarkBase(Generic[W], ABC):
         fallback_reason = getattr(_bench_meta, "fallback_reason", None)
         if fallback_reason:
             result["timing_fallback_reason"] = fallback_reason
+        timing_metric = getattr(_bench_meta, "timing_metric", None)
+        if timing_metric is not None:
+            result["timing_metric"] = timing_metric
+        timing_reduction = getattr(_bench_meta, "timing_reduction", None)
+        if timing_reduction is not None:
+            result["timing_reduction"] = timing_reduction
+        cupti_library_path = getattr(_bench_meta, "cupti_library_path", None)
+        if cupti_library_path is not None:
+            result["timing_cupti_library"] = cupti_library_path
+        cupti_api_version = getattr(_bench_meta, "cupti_api_version", None)
+        if cupti_api_version is not None:
+            result["timing_cupti_api_version"] = cupti_api_version
         if os.getenv("TILEOPS_RECORD_TIMING_DIAGNOSTICS", "0") == "1":
             raw_samples = getattr(_bench_meta, "raw_samples_ms", [])
             result["timing_sample_count"] = len(raw_samples)
             result["timing_cv"] = getattr(_bench_meta, "timing_cv", None)
-            result["timing_metric"] = getattr(_bench_meta, "timing_metric", None)
-            result["timing_trial_means_ms"] = getattr(
-                _bench_meta, "trial_means_ms", []
+            result["timing_trial_reductions_ms"] = getattr(
+                _bench_meta, "trial_reductions_ms", []
             )
+            direct_diagnostics = (
+                ("direct_activity_sum_ms", "timing_activity_sum_median_ms"),
+                ("direct_activity_span_ms", "timing_activity_span_median_ms"),
+                (
+                    "direct_activity_union_busy_ms",
+                    "timing_activity_union_busy_median_ms",
+                ),
+                (
+                    "direct_inter_activity_idle_ms",
+                    "timing_inter_activity_idle_median_ms",
+                ),
+                ("direct_activity_overlap_ms", "timing_activity_overlap_median_ms"),
+            )
+            for source, destination in direct_diagnostics:
+                values = getattr(_bench_meta, source, [])
+                if values:
+                    result[destination] = statistics.median(values)
+            idle_values = getattr(_bench_meta, "direct_inter_activity_idle_ms", [])
+            if idle_values:
+                result["timing_inter_activity_idle_max_ms"] = max(idle_values)
             boundary_margins = getattr(
                 _bench_meta, "direct_boundary_margins_ns", []
             )

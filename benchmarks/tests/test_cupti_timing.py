@@ -3,6 +3,7 @@
 import importlib.util
 import statistics
 from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -21,6 +22,64 @@ def _activity(name, start, end, correlation_id, kind="kernel"):
         value=0,
         kind=kind,
     )
+
+
+def test_load_packaged_cupti_library_records_verified_path_and_version(
+    monkeypatch, tmp_path
+):
+    library_path = tmp_path / "nvidia/cuda_cupti/lib/libcupti.so.12"
+    library_path.parent.mkdir(parents=True)
+    library_path.touch()
+
+    class FakeGetVersion:
+        def __call__(self, version_pointer):
+            version_pointer._obj.value = 28
+            return 0
+
+    fake_library = SimpleNamespace(cuptiGetVersion=FakeGetVersion())
+    fake_distribution = SimpleNamespace(
+        locate_file=lambda relative_path: tmp_path / relative_path
+    )
+    monkeypatch.setattr(
+        direct.importlib.metadata,
+        "distribution",
+        lambda package: fake_distribution,
+    )
+    monkeypatch.setattr(direct.ctypes, "CDLL", lambda *_args, **_kwargs: fake_library)
+    monkeypatch.setattr(direct.torch.version, "cuda", "12.9")
+
+    library, info = direct._load_packaged_cupti_library()
+
+    assert library is fake_library
+    assert info == direct.CuptiRuntimeInfo(str(library_path), 28)
+
+
+def test_load_packaged_cupti_library_rejects_old_api(monkeypatch, tmp_path):
+    library_path = tmp_path / "nvidia/cuda_cupti/lib/libcupti.so.12"
+    library_path.parent.mkdir(parents=True)
+    library_path.touch()
+
+    class FakeGetVersion:
+        def __call__(self, version_pointer):
+            version_pointer._obj.value = 22
+            return 0
+
+    monkeypatch.setattr(
+        direct.importlib.metadata,
+        "distribution",
+        lambda package: SimpleNamespace(
+            locate_file=lambda relative_path: tmp_path / relative_path
+        ),
+    )
+    monkeypatch.setattr(
+        direct.ctypes,
+        "CDLL",
+        lambda *_args, **_kwargs: SimpleNamespace(cuptiGetVersion=FakeGetVersion()),
+    )
+    monkeypatch.setattr(direct.torch.version, "cuda", "12.9")
+
+    with pytest.raises(direct.DirectCuptiUnavailableError, match="older than"):
+        direct._load_packaged_cupti_library()
 
 
 def test_select_activity_sequence_accepts_reordered_complete_set():
@@ -108,10 +167,54 @@ def test_measure_direct_cupti_filters_setup_and_measures_multikernel(
     assert result.inter_activity_idle_ms == pytest.approx([0.00002, 0.00001])
     assert result.activity_overlap_ms == pytest.approx([0.0, 0.0])
     assert result.inter_activity_gap_ms == pytest.approx([0.00002, 0.00001])
+    assert result.cuda_event_span_ms == []
     assert result.metric == metric
     assert result.expected_sequence == direct.activity_sequence(discovery.activities)
     assert result.boundary_margins_ns == [(20, 10), (20, 50)]
     assert calls.count("sync") == 3  # discovery plus two timed iterations
+
+
+def test_measure_direct_cupti_records_optional_same_capture_event_span(monkeypatch):
+    discovery = direct.CuptiActivityBuffers(
+        activities=[_activity("user", 10, 20, 1)]
+    )
+    timing = direct.CuptiActivityBuffers(
+        activities=[_activity("user", 120, 140, 2)]
+    )
+    buffers = iter([discovery, timing])
+
+    @contextmanager
+    def collect(_api):
+        yield next(buffers)
+
+    class FakeEvent:
+        def record(self):
+            pass
+
+        def elapsed_time(self, _end):
+            return 0.000021
+
+    class FakeCupti:
+        timestamps = iter([100, 200])
+
+        @classmethod
+        def get_timestamp(cls):
+            return next(cls.timestamps)
+
+    monkeypatch.setattr(direct, "collect_cupti_activities", collect)
+    monkeypatch.setattr(direct.torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(direct.torch.cuda, "Event", lambda **_kwargs: FakeEvent())
+
+    result = direct.measure_direct_cupti(
+        lambda _iteration: None,
+        lambda _iteration: None,
+        repeats=1,
+        cupti_api=FakeCupti,
+        validate_with_cuda_events=True,
+    )
+
+    assert result.activity_span_ms == pytest.approx([0.00002])
+    assert result.cuda_event_span_ms == pytest.approx([0.000021])
 
 
 def test_activity_timeline_components_separates_idle_and_overlap():

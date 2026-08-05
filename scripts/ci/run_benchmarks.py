@@ -271,7 +271,7 @@ def main() -> int:
         os.environ["TILEOPS_ALLOW_CUDA_EVENTS_FALLBACK"] = "0"
 
     effective_backend = os.environ.get("TILEOPS_TIMING_BACKEND", "cupti-direct")
-    effective_metric = os.environ.get("TILEOPS_DIRECT_CUPTI_METRIC", "activity-sum")
+    effective_metric = os.environ.get("TILEOPS_DIRECT_CUPTI_METRIC", "activity-span")
     fallback_enabled = os.environ.get("TILEOPS_ALLOW_CUDA_EVENTS_FALLBACK", "1") == "1"
     print(
         "timing configuration: "
