@@ -102,6 +102,9 @@ def test_measure_direct_cupti_filters_setup_and_measures_multikernel(
     )
 
     assert result.samples_ms == pytest.approx(expected_samples)
+    assert result.activity_sum_ms == pytest.approx([0.00005, 0.00007])
+    assert result.activity_span_ms == pytest.approx([0.00007, 0.00008])
+    assert result.inter_activity_gap_ms == pytest.approx([0.00002, 0.00001])
     assert result.metric == metric
     assert result.expected_sequence == direct.activity_sequence(discovery.activities)
     assert result.boundary_margins_ns == [(20, 10), (20, 50)]

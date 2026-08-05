@@ -101,6 +101,9 @@ class DirectCuptiMeasurement:
     """Per-iteration timings and the discovery sequence that produced them."""
 
     samples_ms: list[float]
+    activity_sum_ms: list[float]
+    activity_span_ms: list[float]
+    inter_activity_gap_ms: list[float]
     expected_sequence: list[tuple[str, int, int, int, str]]
     metric: str
     # Conservative guard bands around the complete selected GPU activity span.
@@ -306,6 +309,9 @@ def measure_direct_cupti(
     )
     starts = [activity.start for activity in timed_activities]
     samples_ms: list[float] = []
+    activity_sum_ms: list[float] = []
+    activity_span_ms: list[float] = []
+    inter_activity_gap_ms: list[float] = []
     boundary_margins_ns: list[tuple[int, int]] = []
     expected_counts = Counter(expected)
     for iteration, (start, end) in enumerate(timestamp_windows):
@@ -329,14 +335,20 @@ def measure_direct_cupti(
         boundary_margins_ns.append(
             (first_activity_start - start, end - last_activity_end)
         )
-        if metric == "activity-sum":
-            duration_ns = sum(activity.end - activity.start for activity in selected)
-        else:
-            duration_ns = last_activity_end - first_activity_start
+        sum_ns = sum(activity.end - activity.start for activity in selected)
+        span_ns = last_activity_end - first_activity_start
+        gap_ns = span_ns - sum_ns
+        activity_sum_ms.append(sum_ns / 1e6)
+        activity_span_ms.append(span_ns / 1e6)
+        inter_activity_gap_ms.append(gap_ns / 1e6)
+        duration_ns = sum_ns if metric == "activity-sum" else span_ns
         samples_ms.append(duration_ns / 1e6)
 
     return DirectCuptiMeasurement(
         samples_ms=samples_ms,
+        activity_sum_ms=activity_sum_ms,
+        activity_span_ms=activity_span_ms,
+        inter_activity_gap_ms=inter_activity_gap_ms,
         expected_sequence=expected,
         metric=metric,
         boundary_margins_ns=boundary_margins_ns,

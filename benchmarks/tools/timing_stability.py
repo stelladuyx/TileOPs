@@ -150,6 +150,15 @@ def _measurement(
         "direct_boundary_margins_ns": list(
             getattr(_bench_meta, "direct_boundary_margins_ns", [])
         ),
+        "direct_activity_sum_ms": list(
+            getattr(_bench_meta, "direct_activity_sum_ms", [])
+        ),
+        "direct_activity_span_ms": list(
+            getattr(_bench_meta, "direct_activity_span_ms", [])
+        ),
+        "direct_inter_activity_gap_ms": list(
+            getattr(_bench_meta, "direct_inter_activity_gap_ms", [])
+        ),
     }
 
 
@@ -183,6 +192,36 @@ def _aggregate(
             ]
             left_margins = [margin[0] for margin in boundary_margins]
             right_margins = [margin[1] for margin in boundary_margins]
+            activity_sums = [
+                sample
+                for item in successful
+                for sample in item.get("direct_activity_sum_ms", [])
+            ]
+            activity_spans = [
+                sample
+                for item in successful
+                for sample in item.get("direct_activity_span_ms", [])
+            ]
+            inter_activity_gaps = [
+                sample
+                for item in successful
+                for sample in item.get("direct_inter_activity_gap_ms", [])
+            ]
+            round_activity_sums = [
+                statistics.mean(item["direct_activity_sum_ms"])
+                for item in successful
+                if item.get("direct_activity_sum_ms")
+            ]
+            round_activity_spans = [
+                statistics.mean(item["direct_activity_span_ms"])
+                for item in successful
+                if item.get("direct_activity_span_ms")
+            ]
+            round_inter_activity_gaps = [
+                statistics.mean(item["direct_inter_activity_gap_ms"])
+                for item in successful
+                if item.get("direct_inter_activity_gap_ms")
+            ]
             first_half = latencies[: max(1, len(latencies) // 2)]
             second_half = latencies[len(latencies) // 2 :]
             drift_ratio = None
@@ -196,6 +235,14 @@ def _aggregate(
                 "raw_samples_ms": _summary(raw_samples),
                 "left_boundary_margin_ns": _summary(left_margins),
                 "right_boundary_margin_ns": _summary(right_margins),
+                "direct_activity_sum_ms": _summary(activity_sums),
+                "direct_activity_span_ms": _summary(activity_spans),
+                "direct_inter_activity_gap_ms": _summary(inter_activity_gaps),
+                "round_direct_activity_sum_ms": _summary(round_activity_sums),
+                "round_direct_activity_span_ms": _summary(round_activity_spans),
+                "round_direct_inter_activity_gap_ms": _summary(
+                    round_inter_activity_gaps
+                ),
                 "clock_shift_unsafe_samples": sum(
                     left < clock_shift_risk_us * 1_000
                     or right < clock_shift_risk_us * 1_000
@@ -233,13 +280,21 @@ def _acceptance_failures(aggregate: dict[str, Any], args: argparse.Namespace) ->
                 f"{case_name}: direct CUPTI half-run drift {drift:.3f} exceeds "
                 f"±{args.max_drift:.1%}"
             )
-        direct_median = direct["round_latency_ms"]["median"]
+        # Kineto reports the sum of projected activity durations.  Even when
+        # the requested direct metric is activity-span, compare Kineto against
+        # the activity-sum control derived from the exact same CUPTI capture.
+        direct_sum_median = direct["round_direct_activity_sum_ms"]["median"]
+        direct_median = (
+            direct_sum_median
+            if direct_sum_median is not None
+            else direct["round_latency_ms"]["median"]
+        )
         kineto_median = backends["kineto"]["round_latency_ms"]["median"]
         if direct_median is not None and kineto_median is not None:
             ratio = direct_median / kineto_median
             if abs(ratio - 1.0) > args.max_direct_kineto_delta:
                 failures.append(
-                    f"{case_name}: direct/Kineto median ratio {ratio:.3f} exceeds "
+                    f"{case_name}: direct-sum/Kineto median ratio {ratio:.3f} exceeds "
                     f"±{args.max_direct_kineto_delta:.1%}"
                 )
     return failures

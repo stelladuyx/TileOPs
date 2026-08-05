@@ -201,6 +201,9 @@ def _bench_with_direct_cupti(
     raw_samples: list[float] = []
     expected_sequence: list[Any] = []
     boundary_margins_ns: list[tuple[int, int]] = []
+    activity_sum_ms: list[float] = []
+    activity_span_ms: list[float] = []
+    inter_activity_gap_ms: list[float] = []
 
     def prepare_iteration(_iteration: int) -> None:
         cache.zero_()
@@ -224,8 +227,14 @@ def _bench_with_direct_cupti(
             )
         raw_samples.extend(measurement.samples_ms)
         boundary_margins_ns.extend(measurement.boundary_margins_ns)
+        activity_sum_ms.extend(measurement.activity_sum_ms)
+        activity_span_ms.extend(measurement.activity_span_ms)
+        inter_activity_gap_ms.extend(measurement.inter_activity_gap_ms)
         trial_means.append(statistics.mean(measurement.samples_ms))
     _bench_meta.direct_boundary_margins_ns = boundary_margins_ns
+    _bench_meta.direct_activity_sum_ms = activity_sum_ms
+    _bench_meta.direct_activity_span_ms = activity_span_ms
+    _bench_meta.direct_inter_activity_gap_ms = inter_activity_gap_ms
     return trial_means, raw_samples, expected_sequence
 
 
@@ -391,6 +400,9 @@ def bench_kernel(
         # Prevent diagnostics from a prior direct-CUPTI call leaking into a
         # Kineto/CUDA-events measurement or a failed direct attempt.
         _bench_meta.direct_boundary_margins_ns = []
+        _bench_meta.direct_activity_sum_ms = []
+        _bench_meta.direct_activity_span_ms = []
+        _bench_meta.direct_inter_activity_gap_ms = []
         # Warmup is deliberately outside all profiler/activity contexts.
         for iteration in range(n_warmup):
             cache.zero_()

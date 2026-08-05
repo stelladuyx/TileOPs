@@ -39,7 +39,7 @@ def test_acceptance_detects_direct_instability_and_backend_bias():
 
     assert any("round CV" in failure for failure in failures)
     assert any("half-run drift" in failure for failure in failures)
-    assert any("direct/Kineto" in failure for failure in failures)
+    assert any("direct-sum/Kineto" in failure for failure in failures)
 
 
 def test_acceptance_passes_stable_matching_measurements():

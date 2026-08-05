@@ -176,6 +176,36 @@ different host thread after the wrapper returns, and back-to-back windows on
 non-default streams. Those configurations are not used by the current TileOps
 benchmark path and require a separate native-launch stress test before support.
 
+## Locked GPU1 activity-span gap decomposition
+
+The activity-span experiment was repeated on GPU1 with the benchmark process
+pinned to local-NUMA CPU2. During the run, one-second `nvidia-smi dmon` samples
+reported an invariant 1500 MHz SM clock and 3201 MHz memory clock under both
+idle and benchmark load. The run used 10 rounds, 100 repeats, 3 trials, disabled
+fallback, and retained sum, span, and gap from the exact same CUPTI capture.
+
+For the two-kernel BF16 add/mul case:
+
+| Component                            | Result           |
+| ------------------------------------ | ---------------- |
+| Activity-sum round mean              | 3.650 us         |
+| Activity-sum round CV                | 0.21%            |
+| Kineto round median                  | 3.647 us         |
+| Activity-span reported round median  | 11.478 us        |
+| Activity-span reported round CV      | 7.61%            |
+| Inter-activity gap median            | 7.584 us         |
+| Inter-activity gap P90               | 9.152 us         |
+| Maximum observed inter-activity gap  | 3920.672 us      |
+| Inter-activity gap round-mean CV     | 46.06%           |
+| Incomplete sequence / 2-us-risk miss | 0 / 3000 samples |
+
+The kernel activity durations are stable while the gap is not. Frequency
+variation, activity attribution, and sequence changes are ruled out for this
+run; the activity-span instability is driven by time between the two GPU
+activities, including rare millisecond-scale host submission stalls. Exact SOL
+span semantics therefore measure launch-pipeline behavior for short
+multi-kernel callables rather than only GPU execution time.
+
 ### Rejected as default: upstream `activity-span`
 
 The same 10-round experiment with upstream SOL-ExecBench span semantics was
