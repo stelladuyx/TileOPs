@@ -26,6 +26,8 @@ from pathlib import Path
 LOG_TAIL_LINES = 80
 PY_SPY_TIMEOUT_S = 120
 TEARDOWN_TIMEOUT_S = 120
+TIMING_BACKENDS = ("cupti-direct", "kineto", "cuda-events")
+DIRECT_CUPTI_METRICS = ("activity-sum", "activity-span")
 
 # Child preamble; argv[1] = status pipe fd, argv[2:] = pytest args, argv[3]
 # = the bench file. prctl(PR_SET_PTRACER, parent) lets py-spy attach under
@@ -241,7 +243,42 @@ def main() -> int:
         default=4,
         help="upcoming files importing in advance while the current file runs",
     )
+    parser.add_argument(
+        "--timing-backend",
+        choices=TIMING_BACKENDS,
+        help="force one GPU timing backend in every benchmark child process",
+    )
+    parser.add_argument(
+        "--direct-metric",
+        choices=DIRECT_CUPTI_METRICS,
+        help="force one direct-CUPTI metric in every benchmark child process",
+    )
+    parser.add_argument(
+        "--fail-on-timing-fallback",
+        action="store_true",
+        help="disable CUDA-events fallback so a requested timing backend fails closed",
+    )
     args = parser.parse_args()
+
+    # Children inherit the parent environment. Configure timing once here so
+    # every implementation measured by BenchmarkBase (TileOps, Torch, Triton,
+    # vLLM, FA3, etc.) uses the same timing semantics in every pytest process.
+    if args.timing_backend is not None:
+        os.environ["TILEOPS_TIMING_BACKEND"] = args.timing_backend
+    if args.direct_metric is not None:
+        os.environ["TILEOPS_DIRECT_CUPTI_METRIC"] = args.direct_metric
+    if args.fail_on_timing_fallback:
+        os.environ["TILEOPS_ALLOW_CUDA_EVENTS_FALLBACK"] = "0"
+
+    effective_backend = os.environ.get("TILEOPS_TIMING_BACKEND", "cupti-direct")
+    effective_metric = os.environ.get("TILEOPS_DIRECT_CUPTI_METRIC", "activity-sum")
+    fallback_enabled = os.environ.get("TILEOPS_ALLOW_CUDA_EVENTS_FALLBACK", "1") == "1"
+    print(
+        "timing configuration: "
+        f"backend={effective_backend}, metric={effective_metric}, "
+        f"cuda-events-fallback={'enabled' if fallback_enabled else 'disabled'}",
+        flush=True,
+    )
 
     dump_dir = Path(args.dump_dir)
     suites: list[ET.Element] = []

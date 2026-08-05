@@ -142,6 +142,43 @@ def test_fragments_and_profile_logs_merge(tmp_path):
     assert "BETA-REPORT" in profile_log
 
 
+@pytest.mark.smoke
+def test_timing_configuration_reaches_every_benchmark_child(tmp_path):
+    expected = (
+        "    assert os.environ['TILEOPS_TIMING_BACKEND'] == 'cupti-direct'\n"
+        "    assert os.environ['TILEOPS_DIRECT_CUPTI_METRIC'] == 'activity-sum'\n"
+        "    assert os.environ['TILEOPS_ALLOW_CUDA_EVENTS_FALLBACK'] == '0'\n"
+    )
+    bench_dir = _write_bench_dir(
+        tmp_path,
+        {
+            "bench_tileops.py": (
+                "import os\n\ndef test_tileops_backend():\n" + expected
+            ),
+            "bench_torch.py": (
+                "import os\n\ndef test_torch_backend():\n" + expected
+            ),
+        },
+    )
+    proc, out_xml, _ = _run_runner(
+        tmp_path,
+        bench_dir,
+        timeout_per_file="120",
+        extra=[
+            "--timing-backend",
+            "cupti-direct",
+            "--direct-metric",
+            "activity-sum",
+            "--fail-on-timing-fallback",
+        ],
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "backend=cupti-direct, metric=activity-sum" in proc.stdout
+    assert "cuda-events-fallback=disabled" in proc.stdout
+    assert len(_cases(out_xml)) == 2
+
+
 def _error_node_count(out_xml, needle: str) -> int:
     """Count raw <error> nodes attributed to files matching needle."""
     import xml.etree.ElementTree as ET

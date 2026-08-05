@@ -69,6 +69,24 @@ The first command needs no GPU. The Nightly-marked test requires CUDA and
 
 ## Controlled stability experiment
 
+All implementation backends routed through `BenchmarkBase.profile()` share the
+same timing backend. To force direct CUPTI activity-sum across the complete
+benchmark suite, including every isolated pytest child, run:
+
+```bash
+/home/yuxian.du/.venvs/flashmla-sol-cupti/bin/python \
+  scripts/ci/run_benchmarks.py benchmarks/ops \
+  --junit-xml bench_results.xml \
+  --timing-backend cupti-direct \
+  --direct-metric activity-sum \
+  --fail-on-timing-fallback
+```
+
+The fail-closed flag prevents a missing dependency or attribution failure in
+one implementation from silently mixing CUDA-event measurements into the
+direct-CUPTI result set. Kernel-internal autotuning helpers remain unchanged;
+they select compiled configurations and do not produce benchmark report data.
+
 Run the three-backend matrix on the H200 Nightly runner:
 
 ```bash
