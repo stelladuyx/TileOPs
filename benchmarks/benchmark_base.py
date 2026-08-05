@@ -1,10 +1,12 @@
 import contextlib
 import logging
 import os
+import statistics
 import subprocess
 import sys
 import threading
 from abc import ABC, abstractmethod
+from collections import Counter
 from datetime import datetime
 from typing import (
     Any,
@@ -182,6 +184,115 @@ def _native_output_suppressor():
     return suppress_stdout_stderr()
 
 
+_TIMING_BACKENDS = frozenset({"cupti-direct", "kineto", "cuda-events"})
+
+
+def _bench_with_direct_cupti(
+    run_iteration: Callable[[int], Any],
+    cache: torch.Tensor,
+    n_repeat: int,
+    n_trials: int,
+) -> tuple[list[float], list[float], list[Any]]:
+    """Run SOL-style direct CUPTI activity timing without Kineto."""
+    from benchmarks.cupti_timing import measure_direct_cupti
+
+    metric = os.getenv("TILEOPS_DIRECT_CUPTI_METRIC", "activity-sum")
+    trial_means: list[float] = []
+    raw_samples: list[float] = []
+    expected_sequence: list[Any] = []
+
+    def prepare_iteration(_iteration: int) -> None:
+        cache.zero_()
+        # Keep cache/setup activity outside the CUPTI timestamp window.
+        torch.cuda.synchronize()
+
+    for _ in range(n_trials):
+        measurement = measure_direct_cupti(
+            run_iteration,
+            prepare_iteration,
+            n_repeat,
+            metric=metric,
+        )
+        if not expected_sequence:
+            expected_sequence = measurement.expected_sequence
+        elif Counter(measurement.expected_sequence) != Counter(expected_sequence):
+            from benchmarks.cupti_timing import DirectCuptiTraceError
+
+            raise DirectCuptiTraceError(
+                "discovery activity sequence changed between timing trials"
+            )
+        raw_samples.extend(measurement.samples_ms)
+        trial_means.append(statistics.mean(measurement.samples_ms))
+    return trial_means, raw_samples, expected_sequence
+
+
+def _bench_with_kineto(
+    run_iteration: Callable[[int], Any],
+    cache: torch.Tensor,
+    n_repeat: int,
+    n_trials: int,
+) -> tuple[list[float], list[float], list[Any]]:
+    """Run the legacy torch.profiler/Kineto projection timing path."""
+    trial_means: list[float] = []
+    for _ in range(n_trials):
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+        ) as profiler:
+            for iteration in range(n_repeat):
+                cache.zero_()
+                torch.cuda.synchronize()
+                with torch.profiler.record_function(_KERNEL_REGION):
+                    run_iteration(iteration)
+                torch.cuda.synchronize()
+        total_us, n_regions = _sum_kernel_time_us(profiler.profiler.kineto_results)
+        if n_regions != n_repeat:
+            n_cuda_kernels = sum(
+                1
+                for event in profiler.profiler.kineto_results.events()
+                if event.device_type() == DeviceType.CUDA and not event.is_user_annotation()
+            )
+            raise _CuptiProjectionError(
+                f"{n_regions}/{n_repeat} annotation windows projected, "
+                f"{n_cuda_kernels} CUDA kernels captured"
+            )
+        trial_means.append((total_us / n_repeat) * 1e-3)
+    # Kineto exposes only the per-trial aggregate through this optimized parser.
+    return trial_means, list(trial_means), []
+
+
+def _bench_with_cuda_events(
+    run_iteration: Callable[[int], Any],
+    cache: torch.Tensor,
+    n_repeat: int,
+    n_trials: int,
+) -> tuple[list[float], list[float], list[Any]]:
+    """Run the diagnostic CUDA-events fallback and retain raw samples."""
+    trial_means: list[float] = []
+    raw_samples: list[float] = []
+    for _ in range(n_trials):
+        start_events = [torch.cuda.Event(enable_timing=True) for _ in range(n_repeat)]
+        end_events = [torch.cuda.Event(enable_timing=True) for _ in range(n_repeat)]
+
+        for iteration in range(n_repeat):
+            cache.zero_()
+            torch.cuda.synchronize()
+            start_events[iteration].record()
+            run_iteration(iteration)
+            end_events[iteration].record()
+        torch.cuda.synchronize()
+
+        samples = [
+            start.elapsed_time(end)
+            for start, end in zip(start_events, end_events, strict=True)
+        ]
+        raw_samples.extend(samples)
+        trial_means.append(statistics.mean(samples))
+    return trial_means, raw_samples, []
+
+
 # NVIDIA SOL-ExecBench–style benchmark
 
 def bench_kernel(
@@ -191,20 +302,22 @@ def bench_kernel(
     n_repeat: int = 50,
     n_trials: int = 3,
 ) -> float:
-    """Benchmark a GPU kernel with pure kernel timing via CUPTI.
+    """Benchmark a GPU callable with selectable GPU timing backends.
 
     Protocol (adapted from NVIDIA SOL-ExecBench, arxiv.org/abs/2603.19173):
       1. Lock GPU clocks externally (nvidia-smi).
       2. Run *n_warmup* un-timed iterations with L2 flush.
       3. For each of *n_trials* trials, profile *n_repeat* iterations
-         under CUPTI to get pure kernel execution time (no launch overhead).
+         with direct CUPTI activity timing (no Kineto projection).
          L2 is flushed before every iteration.  Input tensors are cloned
          each iteration so the kernel always sees fresh addresses.
       4. Report the median trial mean (robust to outlier trials).
 
-    Uses CUPTI via torch.profiler for accurate kernel-only timing, with
-    direct Kineto C++ event iteration to avoid Python parsing overhead.
-    Falls back to CUDA events if CUPTI is unavailable.
+    The default ``cupti-direct`` backend is adapted from NVIDIA SOL-ExecBench:
+    it discovers the callable's GPU activity sequence, records per-iteration
+    windows using CUPTI timestamps, and validates that every window contains a
+    complete sequence. Set ``TILEOPS_TIMING_BACKEND=kineto`` for an A/B against
+    the legacy projection path, or ``cuda-events`` for diagnostics.
 
     Args:
         fn: Callable to benchmark.  If *args* is provided, called as
@@ -222,6 +335,19 @@ def bench_kernel(
         raise TypeError(
             f"bench_kernel expects a tuple of args, got {type(args).__name__}. "
             "Check that gen_inputs() returns a tuple."
+        )
+    if n_warmup < 0:
+        raise ValueError(f"n_warmup must be non-negative, got {n_warmup}")
+    if n_repeat <= 0:
+        raise ValueError(f"n_repeat must be positive, got {n_repeat}")
+    if n_trials <= 0:
+        raise ValueError(f"n_trials must be positive, got {n_trials}")
+
+    backend = os.getenv("TILEOPS_TIMING_BACKEND", "cupti-direct")
+    if backend not in _TIMING_BACKENDS:
+        raise ValueError(
+            f"unknown TILEOPS_TIMING_BACKEND={backend!r}; "
+            f"expected one of {sorted(_TIMING_BACKENDS)}"
         )
 
     cache = _get_l2_flush_cache()
@@ -258,104 +384,88 @@ def bench_kernel(
             return fn()
     _bench_meta.inputs_cloned = arg_pool is not None or not has_args
 
-    # Warmup (no profiling)
-    for i in range(n_warmup):
-        cache.zero_()
-        _run(i)
-    torch.cuda.synchronize()
-
-    # One plain profiler context per trial; torch.profiler.schedule is avoided
-    # because queued launches leak across its warmup/active boundary.
-    # Kineto's window projection may include a flush merely enqueued before
-    # the window, so the flush is drained (sync) before the timed call and
-    # the call is drained before the next flush; the syncs add host-side
-    # latency only.
-    trial_means: list[float] = []
     try:
-        with _native_output_suppressor():
-            for _ in range(n_trials):
-                with torch.profiler.profile(
-                    # CPU activity is required for Kineto to project the
-                    # annotation window; it never adds device time.
-                    activities=[
-                        torch.profiler.ProfilerActivity.CPU,
-                        torch.profiler.ProfilerActivity.CUDA,
-                    ],
-                ) as profiler:
-                    for i in range(n_repeat):
-                        cache.zero_()
-                        torch.cuda.synchronize()
-                        with torch.profiler.record_function(_KERNEL_REGION):
-                            _run(i)
-                        torch.cuda.synchronize()
-                total_us, n_regions = _sum_kernel_time_us(profiler.profiler.kineto_results)
-                # Untrustworthy trace → CUDA-events fallback; genuine CUDA
-                # errors and OOM propagate.
-                if n_regions != n_repeat:
-                    # Count actual CUDA kernels for diagnostics
-                    n_cuda_kernels = sum(
-                        1 for evt in profiler.profiler.kineto_results.events()
-                        if evt.device_type() == DeviceType.CUDA and not evt.is_user_annotation()
-                    )
-                    _logger.debug(
-                        "CUPTI projection mismatch: %d annotation windows vs %d repeats "
-                        "(%d CUDA kernels captured). This may indicate torch.profiler "
-                        "instability in the current environment. Falling back to CUDA events.",
-                        n_regions, n_repeat, n_cuda_kernels,
-                    )
-                    raise _CuptiProjectionError(
-                        f"{n_regions}/{n_repeat} annotation windows projected, "
-                        f"{n_cuda_kernels} CUDA kernels captured"
-                    )
-                trial_means.append((total_us / n_repeat) * 1e-3)
-        _bench_meta.timing = "cupti"
-    except _CuptiProjectionError as exc:
-        # Check if cuda-events fallback is allowed
-        allow_fallback = os.getenv("TILEOPS_ALLOW_CUDA_EVENTS_FALLBACK", "1") == "1"
+        # Warmup is deliberately outside all profiler/activity contexts.
+        for iteration in range(n_warmup):
+            cache.zero_()
+            _run(iteration)
+        torch.cuda.synchronize()
 
-        if not allow_fallback:
-            raise RuntimeError(
-                f"CUPTI profiling failed: {exc}. "
-                "CUDA-events fallback is disabled (TILEOPS_ALLOW_CUDA_EVENTS_FALLBACK=0). "
-                "This prevents generating inaccurate benchmark data with ~7x inflated latency. "
-                "To debug: run with TILEOPS_ALLOW_CUDA_EVENTS_FALLBACK=1 and check logs."
-            ) from exc
+        try:
+            with _native_output_suppressor():
+                if backend == "cupti-direct":
+                    trial_means, raw_samples, expected_sequence = _bench_with_direct_cupti(
+                        _run, cache, n_repeat, n_trials
+                    )
+                elif backend == "kineto":
+                    trial_means, raw_samples, expected_sequence = _bench_with_kineto(
+                        _run, cache, n_repeat, n_trials
+                    )
+                else:
+                    trial_means, raw_samples, expected_sequence = _bench_with_cuda_events(
+                        _run, cache, n_repeat, n_trials
+                    )
+            actual_backend = backend
+            fallback_reason = None
+        except _CuptiProjectionError as exc:
+            measurement_error: Exception = exc
+        except Exception as exc:
+            # Only expected direct-CUPTI attribution/dependency failures may
+            # enter the configured fallback. Kernel/runtime errors propagate.
+            if backend != "cupti-direct":
+                raise
+            from benchmarks.cupti_timing import DirectCuptiError
 
-        _logger.warning(
-            "CUPTI projection failed (%s); falling back to CUDA-events "
-            "timing, which includes ~50-60us launch overhead per call. "
-            "Latency will be inflated by ~6-7x for fast kernels (<10us). "
-            "Set TILEOPS_ALLOW_CUDA_EVENTS_FALLBACK=0 to prevent fallback.", exc,
+            if not isinstance(exc, DirectCuptiError):
+                raise
+            measurement_error = exc
+        else:
+            measurement_error = None
+
+        if measurement_error is not None:
+            allow_fallback = os.getenv("TILEOPS_ALLOW_CUDA_EVENTS_FALLBACK", "1") == "1"
+            if not allow_fallback:
+                raise RuntimeError(
+                    f"{backend} timing failed: {measurement_error}. "
+                    "CUDA-events fallback is disabled "
+                    "(TILEOPS_ALLOW_CUDA_EVENTS_FALLBACK=0)."
+                ) from measurement_error
+
+            _logger.warning(
+                "%s timing failed (%s); falling back to CUDA events. "
+                "Set TILEOPS_ALLOW_CUDA_EVENTS_FALLBACK=0 to fail closed.",
+                backend,
+                measurement_error,
+            )
+            trial_means, raw_samples, expected_sequence = _bench_with_cuda_events(
+                _run, cache, n_repeat, n_trials
+            )
+            actual_backend = "cuda-events"
+            fallback_reason = f"{type(measurement_error).__name__}: {measurement_error}"
+
+        _bench_meta.timing = actual_backend
+        _bench_meta.requested_timing = backend
+        _bench_meta.raw_samples_ms = list(raw_samples)
+        _bench_meta.trial_means_ms = list(trial_means)
+        _bench_meta.expected_activity_sequence = list(expected_sequence)
+        _bench_meta.timing_metric = (
+            os.getenv("TILEOPS_DIRECT_CUPTI_METRIC", "activity-sum")
+            if actual_backend == "cupti-direct"
+            else "trial-mean" if actual_backend == "kineto" else "event-elapsed"
         )
-        trial_means = []
+        _bench_meta.fallback_reason = fallback_reason
+        if raw_samples and statistics.mean(raw_samples) > 0:
+            _bench_meta.timing_cv = statistics.pstdev(raw_samples) / statistics.mean(raw_samples)
+        else:
+            _bench_meta.timing_cv = 0.0
 
-    # Fallback to CUDA events if CUPTI failed
-    if not trial_means:
-        _bench_meta.timing = "cuda-events"
-        # Mimic CUPTI behavior: flush L2 before measurement window
-        for _ in range(n_trials):
-            start_events = [torch.cuda.Event(enable_timing=True) for _ in range(n_repeat)]
-            end_events = [torch.cuda.Event(enable_timing=True) for _ in range(n_repeat)]
-
-            for i in range(n_repeat):
-                cache.zero_()
-                torch.cuda.synchronize()  # Drain flush before measurement
-                start_events[i].record()
-                _run(i)
-                end_events[i].record()
-            torch.cuda.synchronize()
-
-            times = [s.elapsed_time(e) for s, e in zip(start_events, end_events, strict=True)]
-            trial_means.append(sum(times) / len(times))
-
-    # Free the arg pool and release cached GPU memory to prevent
-    # accumulation across hundreds of benchmark calls.
-    if arg_pool is not None:
-        del arg_pool
-    torch.cuda.empty_cache()
-
-    trial_means.sort()
-    return trial_means[len(trial_means) // 2]
+        trial_means.sort()
+        return trial_means[len(trial_means) // 2]
+    finally:
+        # Release clone storage even when profiling or the callable fails.
+        if arg_pool is not None:
+            del arg_pool
+        torch.cuda.empty_cache()
 
 
 def _get_env_metadata() -> list[str]:
@@ -456,10 +566,25 @@ class BenchmarkBase(Generic[W], ABC):
 
     def _build_result(self, latency: float) -> dict:
         result = {"latency_ms": latency}
-        # Deviations from the default protocol must be visible in reports.
+        # Timing provenance is part of benchmark correctness: never mix direct
+        # CUPTI, Kineto, and CUDA-events records without an explicit backend.
         timing = getattr(_bench_meta, "timing", None)
-        if timing is not None and timing != "cupti":
+        if timing is not None:
             result["timing"] = timing
+        requested_timing = getattr(_bench_meta, "requested_timing", None)
+        if requested_timing is not None and requested_timing != timing:
+            result["timing_requested"] = requested_timing
+        fallback_reason = getattr(_bench_meta, "fallback_reason", None)
+        if fallback_reason:
+            result["timing_fallback_reason"] = fallback_reason
+        if os.getenv("TILEOPS_RECORD_TIMING_DIAGNOSTICS", "0") == "1":
+            raw_samples = getattr(_bench_meta, "raw_samples_ms", [])
+            result["timing_sample_count"] = len(raw_samples)
+            result["timing_cv"] = getattr(_bench_meta, "timing_cv", None)
+            result["timing_metric"] = getattr(_bench_meta, "timing_metric", None)
+            result["timing_trial_means_ms"] = getattr(
+                _bench_meta, "trial_means_ms", []
+            )
         if getattr(_bench_meta, "inputs_cloned", True) is False:
             result["inputs_cloned"] = False
         flops = self.calculate_flops()

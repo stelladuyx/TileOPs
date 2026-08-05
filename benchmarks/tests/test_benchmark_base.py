@@ -9,6 +9,7 @@ protocol contracts rather than nominal ``WorkloadBase`` inheritance.
 import pytest
 import torch
 
+import benchmarks.benchmark_base as benchmark_base
 from benchmarks.benchmark_base import (
     BenchmarkReport,
     BenchmarkWorkload,
@@ -19,6 +20,7 @@ from benchmarks.benchmark_base import (
     bench_kernel,
     workloads_to_params,
 )
+from benchmarks.cupti_timing import DirectCuptiTraceError
 
 # Duck-typed test workloads
 
@@ -239,6 +241,83 @@ def test_kernel_runtime_error_propagates():
 
     with pytest.raises(RuntimeError, match="kernel failure"):
         bench_kernel(boom, n_warmup=0, n_repeat=1, n_trials=1)
+
+
+@pytest.mark.smoke
+def test_bench_kernel_uses_direct_cupti_backend_by_default(monkeypatch):
+    monkeypatch.delenv("TILEOPS_TIMING_BACKEND", raising=False)
+    monkeypatch.setattr(benchmark_base, "_get_l2_flush_cache", lambda: object())
+    monkeypatch.setattr(benchmark_base.torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(benchmark_base.torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        benchmark_base,
+        "_bench_with_direct_cupti",
+        lambda *_args: ([0.011, 0.010, 0.012], [0.010, 0.011, 0.012], ["kernel"]),
+    )
+
+    latency = bench_kernel(lambda: None, n_warmup=0, n_repeat=1, n_trials=3)
+
+    assert latency == pytest.approx(0.011)
+    assert _bench_meta.timing == "cupti-direct"
+    assert _bench_meta.requested_timing == "cupti-direct"
+    assert _bench_meta.raw_samples_ms == [0.010, 0.011, 0.012]
+    assert _bench_meta.fallback_reason is None
+
+
+@pytest.mark.smoke
+def test_direct_cupti_trace_failure_uses_configured_fallback(monkeypatch):
+    monkeypatch.setenv("TILEOPS_TIMING_BACKEND", "cupti-direct")
+    monkeypatch.setenv("TILEOPS_ALLOW_CUDA_EVENTS_FALLBACK", "1")
+    monkeypatch.setattr(benchmark_base, "_get_l2_flush_cache", lambda: object())
+    monkeypatch.setattr(benchmark_base.torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(benchmark_base.torch.cuda, "empty_cache", lambda: None)
+
+    def direct_failure(*_args):
+        raise DirectCuptiTraceError("incomplete activity sequence")
+
+    monkeypatch.setattr(benchmark_base, "_bench_with_direct_cupti", direct_failure)
+    monkeypatch.setattr(
+        benchmark_base,
+        "_bench_with_cuda_events",
+        lambda *_args: ([0.060], [0.059, 0.061], []),
+    )
+
+    latency = bench_kernel(lambda: None, n_warmup=0, n_repeat=2, n_trials=1)
+
+    assert latency == pytest.approx(0.060)
+    assert _bench_meta.timing == "cuda-events"
+    assert _bench_meta.requested_timing == "cupti-direct"
+    assert "incomplete activity sequence" in _bench_meta.fallback_reason
+
+
+@pytest.mark.smoke
+def test_direct_cupti_unexpected_runtime_error_does_not_fallback(monkeypatch):
+    monkeypatch.setenv("TILEOPS_TIMING_BACKEND", "cupti-direct")
+    monkeypatch.setenv("TILEOPS_ALLOW_CUDA_EVENTS_FALLBACK", "1")
+    monkeypatch.setattr(benchmark_base, "_get_l2_flush_cache", lambda: object())
+    monkeypatch.setattr(benchmark_base.torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(benchmark_base.torch.cuda, "empty_cache", lambda: None)
+
+    def runtime_failure(*_args):
+        raise RuntimeError("kernel failed")
+
+    monkeypatch.setattr(benchmark_base, "_bench_with_direct_cupti", runtime_failure)
+    monkeypatch.setattr(
+        benchmark_base,
+        "_bench_with_cuda_events",
+        lambda *_args: pytest.fail("unexpected fallback"),
+    )
+
+    with pytest.raises(RuntimeError, match="kernel failed"):
+        bench_kernel(lambda: None, n_warmup=0, n_repeat=1, n_trials=1)
+
+
+@pytest.mark.smoke
+def test_bench_kernel_rejects_unknown_timing_backend(monkeypatch):
+    monkeypatch.setenv("TILEOPS_TIMING_BACKEND", "unknown")
+
+    with pytest.raises(ValueError, match="TILEOPS_TIMING_BACKEND"):
+        bench_kernel(lambda: None, n_warmup=0, n_repeat=1, n_trials=1)
 
 
 @pytest.fixture
