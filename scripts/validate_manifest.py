@@ -83,7 +83,7 @@ _PROMOTE_TARGET_DTYPE: str = "float32"
 
 # Required top-level fields per op entry
 _REQUIRED_TOP = {"family", "status", "signature", "workloads", "roofline", "source"}
-_VALID_TOP_KEYS = _REQUIRED_TOP | {"ref_api", "variant_of", "torch_compile_fullgraph"}
+_VALID_TOP_KEYS = _REQUIRED_TOP | {"ref_api", "torch_compile_fullgraph"}
 _REQUIRED_SIGNATURE = {"inputs", "outputs"}
 _VALID_SIGNATURE_KEYS = {
     "inputs", "outputs", "params", "shape_rules", "dtype_combos",
@@ -585,6 +585,328 @@ def _l0_kernel_map(
 # container type, type-error phrase, section validator run on type match).
 # Genuinely custom rules (key format, scalar fields, kernel_map) stay as
 # dedicated small validators around the table loop in ``check_l0``.
+# ---------------------------------------------------------------------------
+# optional tensor inputs
+# ---------------------------------------------------------------------------
+
+
+def _optional_input_names(sig: dict) -> list[str]:
+    """Names under ``signature.inputs`` carrying ``optional: true``."""
+    inputs = sig.get("inputs")
+    if not isinstance(inputs, dict):
+        return []
+    return [
+        name for name, attrs in inputs.items()
+        if isinstance(attrs, dict) and attrs.get("optional") is True
+    ]
+
+
+def _check_optional_flag(op_name: str, sig: dict) -> list[str]:
+    """``optional`` is literal ``true``, and only on ``signature.inputs``."""
+    errors: list[str] = []
+    err = _emit_to(errors, "schema", op_name)
+    params = sig.get("params")
+    if isinstance(params, dict):
+        for pname, attrs in params.items():
+            if isinstance(attrs, dict) and "optional" in attrs:
+                err(
+                    f"params.{pname} declares 'optional'; a param expresses "
+                    f"optionality with 'default'"
+                )
+    for direction in ("inputs", "outputs"):
+        tensors = sig.get(direction)
+        if not isinstance(tensors, dict):
+            continue
+        for tname, attrs in tensors.items():
+            if not isinstance(attrs, dict) or "optional" not in attrs:
+                continue
+            if direction != "inputs":
+                err(
+                    f"{direction}.{tname} declares 'optional'; only a "
+                    f"signature.inputs tensor may be optional"
+                )
+            elif attrs["optional"] is not True:
+                err(
+                    f"inputs.{tname}.optional must be literal true, got "
+                    f"{attrs['optional']!r} (omit the key when not optional)"
+                )
+    return errors
+
+
+def _guard_scopes(
+    node: ast.AST, optional: Collection[str]
+) -> list[tuple[ast.AST, set[str]]]:
+    """Operands of a top-level ``or``, each with the names guarded before it.
+
+    ``or`` short-circuits left to right, so an operand never evaluates unless
+    every earlier operand was false. An earlier ``X is None`` disjunct
+    therefore means ``X`` is present by the time a later operand runs, whatever
+    the operands in between test.
+    """
+    if not isinstance(node, ast.BoolOp) or not isinstance(node.op, ast.Or):
+        return [(node, set())]
+    scopes: list[tuple[ast.AST, set[str]]] = []
+    guarded: set[str] = set()
+    for operand in node.values:
+        scopes.append((operand, set(guarded)))
+        name = _presence_test_name(operand, optional, want_is_none=True)
+        if name is not None:
+            guarded.add(name)
+    return scopes
+
+
+def _presence_test_name(
+    node: ast.AST, optional: Collection[str], *, want_is_none: bool | None = None
+) -> str | None:
+    """Return the optional name of a bare ``X is None`` / ``X is not None``."""
+    if not isinstance(node, ast.Compare) or len(node.ops) != 1:
+        return None
+    op = node.ops[0]
+    if not isinstance(op, (ast.Is, ast.IsNot)):
+        return None
+    if not (isinstance(node.comparators[0], ast.Constant)
+            and node.comparators[0].value is None):
+        return None
+    if not isinstance(node.left, ast.Name) or node.left.id not in optional:
+        return None
+    if want_is_none is True and not isinstance(op, ast.Is):
+        return None
+    return node.left.id
+
+
+def _unguarded_uses(
+    tree: ast.AST, optional: Collection[str], guarded: Collection[str]
+) -> list[str]:
+    """Optional names used for anything other than a permitted presence test."""
+    bad: list[str] = []
+    presence_nodes: set[int] = set()
+    for node in ast.walk(tree):
+        if _presence_test_name(node, optional) is not None:
+            presence_nodes.add(id(node.left))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Name) or node.id not in optional:
+            continue
+        if id(node) in presence_nodes or node.id in guarded:
+            continue
+        bad.append(node.id)
+    return sorted(set(bad))
+
+
+def _check_optional_in_shape_rules(
+    op_name: str, sig: dict, optional: Collection[str]
+) -> list[str]:
+    """In ``shape_rules``, a use needs an earlier ``X is None`` disjunct."""
+    errors: list[str] = []
+    err = _emit_to(errors, "schema", op_name)
+    rules = sig.get("shape_rules")
+    if not optional or not isinstance(rules, list):
+        return errors
+    for index, rule in enumerate(rules):
+        if not isinstance(rule, str):
+            continue
+        try:
+            tree = ast.parse(rule, mode="eval").body
+        except SyntaxError:
+            continue  # reported by _check_shape_rule_callables
+        bad: list[str] = []
+        for operand, guarded in _guard_scopes(tree, optional):
+            bad.extend(_unguarded_uses(operand, optional, guarded))
+        for name in sorted(set(bad)):
+            err(
+                f"shape_rules[{index}] uses optional input '{name}' without a "
+                f"preceding '{name} is None' disjunct: {rule!r}. Write "
+                f"'{name} is None or <condition>'; the 'is not None and' form "
+                f"reports a legal absent call as a violation"
+            )
+    return errors
+
+
+def _check_optional_in_roofline(
+    op_name: str, entry: dict, optional: Collection[str]
+) -> list[str]:
+    """A roofline presence test lives in ``vars`` and nowhere else."""
+    errors: list[str] = []
+    err = _emit_to(errors, "schema", op_name)
+    roofline = entry.get("roofline")
+    if not optional or not isinstance(roofline, dict):
+        return errors
+
+    # vars: a bare presence test is the one permitted position.
+    if isinstance(roofline.get("vars"), dict):
+        for vname, vexpr in roofline["vars"].items():
+            if not isinstance(vexpr, str):
+                continue
+            try:
+                tree = ast.parse(vexpr, mode="eval").body
+            except SyntaxError:
+                continue  # reported by the roofline codegen namespace check
+            for name in _unguarded_uses(tree, optional, ()):
+                err(
+                    f"roofline.vars.{vname} uses optional input '{name}' for "
+                    f"something other than a presence test: {vexpr!r}. Only "
+                    f"'{name} is None' / '{name} is not None' is allowed here; "
+                    f"a formula that needs the tensor's own shape uses "
+                    f"roofline.func instead"
+                )
+
+    # flops / bytes: the arithmetic layer reads vars, params and elem_bytes, so
+    # a tensor name never resolves there — not even in a presence test.
+    for field in ("flops", "bytes"):
+        expr = roofline.get(field)
+        if not isinstance(expr, str):
+            continue
+        try:
+            tree = ast.parse(expr, mode="eval").body
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and node.id in optional:
+                err(
+                    f"roofline.{field} names optional input '{node.id}': "
+                    f"{expr!r}. Put the presence test in a roofline.vars entry "
+                    f"and read that name here"
+                )
+                break
+    return errors
+
+
+def _check_optional_in_dtype_positions(
+    op_name: str, sig: dict, optional: Collection[str]
+) -> list[str]:
+    """No optional name as a ``dtype_combos`` key or a ``same_as`` ref."""
+    errors: list[str] = []
+    err = _emit_to(errors, "schema", op_name)
+    if not optional:
+        return errors
+    combos = sig.get("dtype_combos")
+    if isinstance(combos, list):
+        for index, row in enumerate(combos):
+            if not isinstance(row, dict):
+                continue
+            for name in sorted(set(row) & set(optional)):
+                err(
+                    f"dtype_combos[{index}] has a column for optional input "
+                    f"'{name}'; a row assigns a dtype on every call it covers "
+                    f"and an absent input has none"
+                )
+    for direction in ("inputs", "outputs"):
+        tensors = sig.get(direction)
+        if not isinstance(tensors, dict):
+            continue
+        for tname, attrs in tensors.items():
+            if not isinstance(attrs, dict):
+                continue
+            dtype = attrs.get("dtype")
+            if not isinstance(dtype, str):
+                continue
+            for ref in _SAME_AS_RE.findall(dtype):
+                if ref in optional:
+                    err(
+                        f"{direction}.{tname}.dtype references optional input "
+                        f"'{ref}' through same_as(); an absent input has no "
+                        f"dtype to resolve to"
+                    )
+    return errors
+
+
+def _shape_symbols(shape: object) -> set[str]:
+    """Identifier-shaped dims of a ``"[A, B, 4]"`` shape declaration."""
+    if not isinstance(shape, str):
+        return set()
+    body = shape.strip()
+    if not (body.startswith("[") and body.endswith("]")):
+        return set()
+    return {
+        d.strip() for d in body[1:-1].split(",")
+        if _IDENT_RE.match(d.strip() or "0")
+    }
+
+
+def _check_optional_shape_symbol_scope(
+    op_name: str, sig: dict, optional: Collection[str]
+) -> list[str]:
+    """Symbols first bound by an optional input stay in its scope."""
+    errors: list[str] = []
+    err = _emit_to(errors, "schema", op_name)
+    inputs = sig.get("inputs")
+    if not optional or not isinstance(inputs, dict):
+        return errors
+    global_syms: set[str] = set()
+    for name, attrs in inputs.items():
+        if name in optional or not isinstance(attrs, dict):
+            continue
+        global_syms |= _shape_symbols(attrs.get("shape"))
+    params = sig.get("params")
+    if isinstance(params, dict):
+        global_syms |= set(params)
+    local_syms: dict[str, str] = {}
+    for name in optional:
+        attrs = inputs.get(name)
+        if isinstance(attrs, dict):
+            for sym in _shape_symbols(attrs.get("shape")) - global_syms:
+                local_syms.setdefault(sym, name)
+    if not local_syms:
+        return errors
+    for direction in ("inputs", "outputs"):
+        tensors = sig.get(direction)
+        if not isinstance(tensors, dict):
+            continue
+        for tname, attrs in tensors.items():
+            if tname in optional or not isinstance(attrs, dict):
+                continue
+            leaked = sorted(_shape_symbols(attrs.get("shape")) & set(local_syms))
+            for sym in leaked:
+                err(
+                    f"{direction}.{tname}.shape uses '{sym}', which is bound "
+                    f"only by optional input '{local_syms[sym]}'; that symbol "
+                    f"has no value on a call that omits it"
+                )
+    return errors
+
+
+def _check_optional_workload_coverage(
+    op_name: str, entry: dict, optional: Collection[str]
+) -> list[str]:
+    """Each optional input needs a passed row and an omitted row."""
+    errors: list[str] = []
+    err = _emit_to(errors, "schema", op_name)
+    workloads = entry.get("workloads")
+    if not optional or not isinstance(workloads, list) or not workloads:
+        return errors
+    if entry.get("status") == "spec-only":
+        return errors
+    rows = [row for row in workloads if isinstance(row, dict)]
+    for name in sorted(optional):
+        key = f"{name}_shape"
+        passed = any(key in row for row in rows)
+        omitted = any(key not in row for row in rows)
+        if not passed:
+            err(
+                f"no workload row passes optional input '{name}' — add a row "
+                f"carrying '{key}'"
+            )
+        if not omitted:
+            err(
+                f"every workload row passes optional input '{name}' — add a "
+                f"row without '{key}'"
+            )
+    return errors
+
+
+def _l0_optional(op_name: str, entry: dict, sig: dict) -> list[str]:
+    """All optional-input checks for one entry."""
+    errors = _check_optional_flag(op_name, sig)
+    optional = _optional_input_names(sig)
+    if not optional:
+        return errors
+    errors.extend(_check_optional_in_shape_rules(op_name, sig, optional))
+    errors.extend(_check_optional_in_roofline(op_name, entry, optional))
+    errors.extend(_check_optional_in_dtype_positions(op_name, sig, optional))
+    errors.extend(_check_optional_shape_symbol_scope(op_name, sig, optional))
+    errors.extend(_check_optional_workload_coverage(op_name, entry, optional))
+    return errors
+
+
 _L0_SECTIONS = (
     ("signature", dict, "a mapping", _l0_signature),
     ("workloads", list, "a list", _l0_workloads),
@@ -608,6 +930,10 @@ def check_l0(
 
     errors.extend(_l0_key_format(op_name, all_op_names))
 
+    sig = entry.get("signature")
+    if isinstance(sig, dict):
+        errors.extend(_l0_optional(op_name, entry, sig))
+
     # Top-level required fields
     missing_top = _REQUIRED_TOP - set(entry.keys())
     if missing_top:
@@ -629,10 +955,6 @@ def check_l0(
             f"valid keys are {sorted(_VALID_TOP_KEYS)}"
         )
 
-    # variant_of: must be a string if present (R16); cross-entry checks
-    # in check_variant_of_consistency().
-    if "variant_of" in entry and not isinstance(entry["variant_of"], str):
-        err("variant_of must be a string")
 
     # ref_api: required string — fully qualified PyTorch API equivalent
     # or "none".
@@ -699,68 +1021,6 @@ def check_source_paths(op_name: str, entry: dict, repo_root: Path) -> list[str]:
             errors.append(
                 f"[schema] {op_name}: source.{key} is not a file: {rel_path}"
             )
-    return errors
-
-
-# ---------------------------------------------------------------------------
-# variant_of: cross-entry consistency (R16)
-# ---------------------------------------------------------------------------
-
-def check_variant_of_consistency(
-    ops: dict, *, scope: set[str] | None = None
-) -> list[str]:
-    """Validate variant_of references across all entries.
-
-    Per R16: variant_of must reference an existing op; the primary must
-    not itself be a variant (no chaining); variant and primary must
-    share source.kernel and source.op. When *scope* is given, only ops
-    named in *scope* are checked; lookups still use the full dict so
-    reference resolution works.
-    """
-    errors: list[str] = []
-
-    for op_name, entry in ops.items():
-        if scope is not None and op_name not in scope:
-            continue
-        if not isinstance(entry, dict):
-            continue  # malformed entry — check_l0 will report it
-        primary_name = entry.get("variant_of")
-        if primary_name is None:
-            continue
-
-        # Target must exist
-        if primary_name not in ops:
-            errors.append(
-                f"[schema] {op_name}: variant_of '{primary_name}' "
-                f"does not exist in the manifest"
-            )
-            continue
-
-        primary = ops[primary_name]
-        if not isinstance(primary, dict):
-            continue  # malformed primary — check_l0 will report it
-
-        # Single-level: primary must not be a variant itself
-        if "variant_of" in primary:
-            errors.append(
-                f"[schema] {op_name}: variant_of '{primary_name}' is itself "
-                f"a variant (chaining not allowed per R16)"
-            )
-
-        # Shared source.kernel and source.op
-        src = entry.get("source", {})
-        pri_src = primary.get("source", {})
-        if src.get("kernel") != pri_src.get("kernel"):
-            errors.append(
-                f"[schema] {op_name}: source.kernel differs from primary "
-                f"'{primary_name}' (must match per R16)"
-            )
-        if src.get("op") != pri_src.get("op"):
-            errors.append(
-                f"[schema] {op_name}: source.op differs from primary "
-                f"'{primary_name}' (must match per R16)"
-            )
-
     return errors
 
 
@@ -1374,16 +1634,20 @@ def check_l3_dtype_combos_data(op_name: str, sig: dict) -> list[str]:
         errors.extend(_diagnose_unresolvable_signature(op_name, sig))
         return errors
     inputs = sig.get("inputs") or {}
+    optional_names = set(_optional_input_names(sig))
     declared_input_names: list[str] = (
-        list(inputs.keys()) if isinstance(inputs, dict) else []
+        [n for n in inputs if n not in optional_names]
+        if isinstance(inputs, dict) else []
     )
     for i, combo in enumerate(dtype_combos):
         if not isinstance(combo, dict):
             continue
-        # Combo-row completeness: every declared signature.inputs tensor
+        # Combo-row completeness: every required signature.inputs tensor
         # must be assigned a dtype in every combo row; otherwise a row
         # omitting an input would pass L3 when no ``_validate_dtypes``
-        # override exists (``_combo_accepted`` never runs for it).
+        # override exists (``_combo_accepted`` never runs for it). An
+        # optional input is never a column: a row assigns a dtype on every
+        # call it covers, and an absent input has none.
         for input_name in declared_input_names:
             if input_name not in combo:
                 err(
@@ -1580,8 +1844,73 @@ def _input_bound_symbols(sig: dict) -> set[str]:
     return bound
 
 
+def _optional_inputs(sig: dict) -> set[str]:
+    """Input names declared ``optional: true`` (R18)."""
+    inputs = sig.get("inputs")
+    if not isinstance(inputs, dict):
+        return set()
+    return {
+        name for name, attrs in inputs.items()
+        if isinstance(name, str)
+        and isinstance(attrs, dict)
+        and attrs.get("optional") is True
+    }
+
+
+# Witness values for a required param the workloads do not pin. Positive and
+# type-valid, so a shape sized by the param stays a legal extent.
+_REQUIRED_PARAM_WITNESS: dict[str, object] = {
+    "int": _MOCK_DIM_SIZE,
+    "float": 1.0,
+    "bool": True,
+}
+
+
+def _param_env(sig: dict, workloads: object, absent: Collection[str] = ()) -> dict:
+    """Parameter values every probe of a generated method runs under.
+
+    A param carrying a ``default`` contributes it. A param that omits one is
+    required — the op cannot be constructed without it — so it contributes a
+    deterministic witness instead: the value the first workload pins, else a
+    type-valid positive scalar. Probing without it would leave
+    ``self.<param>`` unset and turn a parameter-sized output into an
+    AttributeError, which says nothing about the manifest.
+
+    *absent* names the optional inputs this probe withholds. Only rows whose
+    presence pattern matches are pinned from, so a probe that supplies an
+    optional input runs under the params of a call that actually supplies it —
+    otherwise every probe would use the first row, and a param that only
+    differs on those rows would never reach the generated method.
+    """
+    params = sig.get("params")
+    if not isinstance(params, dict):
+        return {}
+    env = _param_defaults(params)
+    rows = [w for w in workloads if isinstance(w, dict)] if isinstance(workloads, list) else []
+    optional = _optional_inputs(sig)
+    if optional:
+        matching = [
+            w for w in rows
+            if all((f"{name}_shape" in w) == (name not in absent) for name in optional)
+        ]
+        rows = matching or rows
+    for pname, pattrs in params.items():
+        if not isinstance(pname, str) or not isinstance(pattrs, dict):
+            continue
+        if pname in env:
+            continue
+        pinned = next((w[pname] for w in rows if pname in w), None)
+        if pinned is not None:
+            env[pname] = pinned
+            continue
+        witness = _REQUIRED_PARAM_WITNESS.get(pattrs.get("type"))
+        if witness is not None:
+            env[pname] = witness
+    return env
+
+
 def _mock_input_shapes(
-    sig: dict,
+    sig: dict, param_env: dict | None = None,
 ) -> tuple[dict[str, _MockShape], dict[str, int]] | None:
     """Derive concrete mock input shapes for every declared input.
 
@@ -1592,6 +1921,10 @@ def _mock_input_shapes(
     name to the integer size used in the mock shapes, so callers can bind
     those names into a shape_rules evaluation context. Returns None only
     if ``signature.inputs`` is malformed.
+
+    A dim name that is also a param in *param_env* takes that param's
+    integer value rather than a synthetic size, so the mock inputs and the
+    parameters the probe runs under describe one consistent op.
     """
     inputs = sig.get("inputs")
     if not isinstance(inputs, dict) or not inputs:
@@ -1615,18 +1948,33 @@ def _mock_input_shapes(
     # get distinct sizes (first-seen order) so cross-tensor equality
     # rules do not spuriously pass on colliding mock sizes.
     dim_sizes: dict[str, int] = {}
+    pinned = {
+        name: int(val) for name, val in (param_env or {}).items()
+        if isinstance(val, int) and not isinstance(val, bool) and val > 0
+    }
+    next_synthetic = _MOCK_DIM_SIZE
+
+    def _bind_dim(p: str) -> None:
+        nonlocal next_synthetic
+        if p in dim_sizes:
+            return
+        if p in pinned:
+            dim_sizes[p] = pinned[p]
+            return
+        dim_sizes[p] = next_synthetic
+        next_synthetic += 1
+
     for _tname, parts in rule_literals:
         for p in parts:
-            if _IDENT_RE.fullmatch(p) and p not in dim_sizes:
-                dim_sizes[p] = _MOCK_DIM_SIZE + len(dim_sizes)
+            if _IDENT_RE.fullmatch(p):
+                _bind_dim(p)
 
     # Also bind symbolic dims from input shape declarations, then from
     # declared output shapes, so downstream rule / shape-decl checks
     # resolve them against the same mock sizes.
     for parts in shape_decls.values():
         for p in parts:
-            if p not in dim_sizes:
-                dim_sizes[p] = _MOCK_DIM_SIZE + len(dim_sizes)
+            _bind_dim(p)
     outputs_map = sig.get("outputs") or {}
     if isinstance(outputs_map, dict):
         for attrs in outputs_map.values():
@@ -1636,8 +1984,7 @@ def _mock_input_shapes(
             if out_parts is None:
                 continue
             for p in out_parts:
-                if p not in dim_sizes:
-                    dim_sizes[p] = _MOCK_DIM_SIZE + len(dim_sizes)
+                _bind_dim(p)
 
     for name in inputs:
         if name in ranks:
@@ -1944,7 +2291,6 @@ def check_l2_infer_parity(
     errors: list[str] = []
     if cls is None:
         return errors
-    err = _emit_to(errors, "shape", op_name)
     warn = _emit_to(warnings, "shape", op_name)
 
     sig = entry.get("signature", {})
@@ -1977,20 +2323,72 @@ def check_l2_infer_parity(
     if infer_fn is None:
         return errors
 
-    mock = _mock_input_shapes(sig)
-    if mock is None:
-        return errors
-    mock_shapes, dim_sizes = mock
+    # Presence of an optional input is the declared dispatch fact (R18), so the
+    # probe runs once with every optional input supplied and once with none.
+    optional = _optional_inputs(sig)
+    variants: list[frozenset[str]] = [frozenset()]
+    if optional:
+        variants.append(frozenset(optional))
+    for absent in variants:
+        param_env = _param_env(sig, entry.get("workloads"), absent)
+        mock = _mock_input_shapes(sig, param_env)
+        if mock is None:
+            return errors
+        errors.extend(_probe_infer_parity(
+            op_name, sig, cls, infer_fn, mock, param_env, absent,
+            declared_output_shapes, rules, warnings=warnings,
+        ))
+    return errors
 
-    params = sig.get("params") or {}
-    param_defaults = _param_defaults(params)
+
+def _probe_infer_parity(
+    op_name: str,
+    sig: dict,
+    cls: type,
+    infer_fn,
+    mock: tuple[dict[str, _MockShape], dict[str, int]],
+    param_env: dict,
+    absent: frozenset[str],
+    declared_output_shapes: dict[str, list[str]],
+    rules: list,
+    *,
+    warnings: list[str] | None,
+) -> list[str]:
+    """One parity probe of ``_infer_output_shapes`` over the mock inputs.
+
+    *absent* names the optional inputs this probe withholds; their
+    ``<name>_shape`` argument is passed as ``None`` and every shape rule
+    mentioning one of them is skipped, since such a rule constrains the
+    argument only when it is supplied.
+    """
+    errors: list[str] = []
+    suffix = (
+        f" (probed with {', '.join(sorted(absent))} absent)" if absent else ""
+    )
+
+    def err(msg: str) -> None:
+        errors.append(f"[shape] {op_name}: {msg}{suffix}")
+
+    def warn(msg: str) -> None:
+        if warnings is not None:
+            warnings.append(f"[shape] {op_name}: {msg}{suffix}")
+
+    all_mock_shapes, dim_sizes = mock
+    mock_shapes = {
+        name: shape for name, shape in all_mock_shapes.items()
+        if name not in absent
+    }
 
     # Resolve static_dims against the mock inputs so implementations reading
     # ``self.<dim>`` do not AttributeError and silently skip the check.
-    extra_attrs = _static_dim_values(sig, mock_shapes, param_defaults)
-    mock_self = _build_mock_self(cls, param_defaults, extra_attrs)
+    extra_attrs = _static_dim_values(sig, mock_shapes, param_env)
+    mock_self = _build_mock_self(cls, param_env, extra_attrs)
 
-    shape_kwargs = {f"{name}_shape": tuple(shape) for name, shape in mock_shapes.items()}
+    shape_kwargs: dict[str, object] = {
+        f"{name}_shape": tuple(shape) for name, shape in mock_shapes.items()
+    }
+    for name in absent:
+        shape_kwargs[f"{name}_shape"] = None
     # Bind before calling: only a TypeError from ``bind`` is a signature
     # mismatch. TypeErrors from the body must not be reported as one.
     try:
@@ -2043,7 +2441,7 @@ def check_l2_infer_parity(
     # later in the dict take precedence on any accidental collision.
     ctx: dict = {}
     ctx.update(dim_sizes)
-    ctx.update(param_defaults)
+    ctx.update(param_env)
     for name, shape in mock_shapes.items():
         ctx[name] = _MockShape(shape)
     # Rebind output-only symbols from the inferred ``result`` so their rules
@@ -2093,6 +2491,10 @@ def check_l2_infer_parity(
     for i, rule in enumerate(rules):
         if not isinstance(rule, str):
             continue
+        if any(
+            re.search(rf"\b{re.escape(name)}\b", rule) for name in absent
+        ):
+            continue
         ok, reason = _eval_shape_rule(rule, ctx)
         if reason is not None:
             # Could not evaluate this rule under the mock context; do not
@@ -2134,15 +2536,15 @@ def check_l2_infer_parity(
         name: int(val) for name, val in extra_attrs.items()
         if isinstance(val, int) and not isinstance(val, bool)
     }
-    # An int ``default`` is compile-time known, so it pins a dim with the same
-    # authority as ``static_dims``. No default or non-int → cannot pin.
-    for pname, pdefault in param_defaults.items():
+    # An int param value is compile-time known, so it pins a dim with the same
+    # authority as ``static_dims``. Non-int → cannot pin.
+    for pname, pvalue in param_env.items():
         if pname in static_expected:
             continue  # static_dims wins — it is the declared source of truth.
-        if isinstance(pdefault, bool):
+        if isinstance(pvalue, bool):
             continue
-        if isinstance(pdefault, int):
-            static_expected[pname] = int(pdefault)
+        if isinstance(pvalue, int):
+            static_expected[pname] = int(pvalue)
     output_only_seen: dict[str, int] = {}
     for out_name, decl_parts in declared_output_shapes.items():
         if out_name not in result:
@@ -2350,7 +2752,7 @@ def _make_mock_tensor(dtype_name: str):
 
 def _combo_accepted(
     cls: type, forward_inputs: list[str], combo: dict[str, str],
-    param_defaults: dict, sig: dict | None = None,
+    param_env: dict, sig: dict | None = None,
     self_dtype_name: str | None = None,
 ) -> tuple[bool, str | None]:
     """Invoke ``cls._validate_dtypes`` on a mock-self with *combo*.
@@ -2389,11 +2791,11 @@ def _combo_accepted(
     # (beyond manifest params) do not falsely raise AttributeError.
     extra_attrs: dict = {}
     if sig is not None:
-        mock = _mock_input_shapes(sig)
+        mock = _mock_input_shapes(sig, param_env)
         if mock is not None:
             mock_shapes, _ = mock
             extra_attrs.update(
-                _static_dim_values(sig, mock_shapes, param_defaults)
+                _static_dim_values(sig, mock_shapes, param_env)
             )
         # self.dtype tracks the candidate's primary dtype (first non-same_as
         # input, or ``self_dtype_name``) so a derived _validate_dtypes comparing
@@ -2407,7 +2809,7 @@ def _combo_accepted(
             primary = _primary_dtype_input(sig, forward_inputs)
             if primary is not None and primary in tensors:
                 extra_attrs["dtype"] = tensors[primary].dtype
-    mock_self = _build_mock_self(cls, param_defaults, extra_attrs)
+    mock_self = _build_mock_self(cls, param_env, extra_attrs)
     # Pre-bind the callable signature so only genuine signature mismatches
     # surface as ``TypeError: ...``. TypeError raised from inside the body
     # (e.g. comparing incompatible torch dtypes) is a legitimate rejection
@@ -2482,7 +2884,7 @@ def _probe_out_of_union(
     forward_inputs: list[str],
     baseline: dict[str, str],
     dtype_options: dict[str, list[str]],
-    param_defaults: dict,
+    param_env: dict,
     errors: list[str],
     warnings: list[str] | None,
 ) -> None:
@@ -2530,7 +2932,7 @@ def _probe_out_of_union(
                 if ref == target and tname in candidate:
                     candidate[tname] = bad_dtype
             accepted, reason = _combo_accepted(
-                cls, forward_inputs, candidate, param_defaults,
+                cls, forward_inputs, candidate, param_env,
                 sig=sig, self_dtype_name=baseline_self_dtype,
             )
             if _probe_reason_kind(reason) == "unexpected":
@@ -2590,9 +2992,11 @@ def check_l3_validate_dtypes_parity(
         return errors
 
     # Only pass tensors corresponding to manifest inputs (forward args).
-    forward_inputs = list(inputs.keys())
-    params = sig.get("params") or {}
-    param_defaults = _param_defaults(params)
+    # An optional input is never a dtype_combos column, so a probe that
+    # demanded one for it could never be satisfied.
+    optional_inputs = set(_optional_input_names(sig))
+    forward_inputs = [n for n in inputs if n not in optional_inputs]
+    param_env = _param_env(sig, entry.get("workloads"))
 
     dtype_options = _resolve_tensor_dtype_options(sig)
     if dtype_options is None:
@@ -2635,7 +3039,7 @@ def check_l3_validate_dtypes_parity(
             if not isinstance(combo, dict):
                 continue
             accepted, reason = _combo_accepted(
-                cls, forward_inputs, combo, param_defaults, sig=sig,
+                cls, forward_inputs, combo, param_env, sig=sig,
             )
             kind = _probe_reason_kind(reason)
             if kind == "signature":
@@ -2673,6 +3077,25 @@ def check_l3_validate_dtypes_parity(
                     f"{combo!r} listed in manifest"
                 )
 
+        # The optional inputs have no combo column, so the loop above never
+        # passes one. Probe the other side too: each listed combo, augmented
+        # with every optional at a declared dtype, must still be accepted.
+        for name in sorted(optional_inputs):
+            for dtype_name in dtype_options.get(name) or []:
+                for i, combo in enumerate(dtype_combos):
+                    if not isinstance(combo, dict):
+                        continue
+                    accepted, reason = _combo_accepted(
+                        cls, forward_inputs + [name],
+                        {**combo, name: dtype_name}, param_env, sig=sig,
+                    )
+                    if reason is None and not accepted:
+                        err(
+                            f"_validate_dtypes rejects dtype_combos[{i}] "
+                            f"{combo!r} once optional input {name!r} is "
+                            f"passed as {dtype_name}"
+                        )
+
         # Every non-listed combo drawn from the inputs' union must be
         # rejected. Enumerate the full Cartesian product and report any
         # non-listed combo that ``_validate_dtypes`` accepts. Breaking on
@@ -2704,7 +3127,7 @@ def check_l3_validate_dtypes_parity(
             candidate = dict(zip(forward_inputs, tup, strict=True))
             checked_any = True
             accepted, reason = _combo_accepted(
-                cls, forward_inputs, candidate, param_defaults, sig=sig,
+                cls, forward_inputs, candidate, param_env, sig=sig,
             )
             kind = _probe_reason_kind(reason)
             if kind in ("introspect", "signature"):
@@ -2737,7 +3160,7 @@ def check_l3_validate_dtypes_parity(
         if baseline_combo is not None:
             _probe_out_of_union(
                 op_name, cls, sig, forward_inputs, baseline_combo,
-                dtype_options, param_defaults, errors, warnings,
+                dtype_options, param_env, errors, warnings,
             )
 
         if not errors:
@@ -2781,7 +3204,7 @@ def check_l3_validate_dtypes_parity(
             if not _honours_same_as(sig, candidate):
                 continue
             accepted, reason = _combo_accepted(
-                cls, forward_inputs, candidate, param_defaults, sig=sig,
+                cls, forward_inputs, candidate, param_env, sig=sig,
             )
             kind = _probe_reason_kind(reason)
             if kind == "signature":
@@ -2825,7 +3248,7 @@ def check_l3_validate_dtypes_parity(
         if baseline is not None:
             _probe_out_of_union(
                 op_name, cls, sig, forward_inputs, baseline,
-                dtype_options, param_defaults, errors, warnings,
+                dtype_options, param_env, errors, warnings,
             )
 
         # same_as identity negative probe (R3 rejection side): each
@@ -2854,7 +3277,7 @@ def check_l3_validate_dtypes_parity(
                     candidate = dict(baseline)
                     candidate[tname] = alt
                     accepted, reason = _combo_accepted(
-                        cls, forward_inputs, candidate, param_defaults, sig=sig,
+                        cls, forward_inputs, candidate, param_env, sig=sig,
                     )
                     kind = _probe_reason_kind(reason)
                     if kind in ("introspect", "signature"):
@@ -3461,8 +3884,8 @@ def validate_manifest(
     are informational. ``manifest_path=None`` loads the merged manifest
     from the ``tileops.manifest`` package (tests pass a temp file for
     synthetic single-file manifests). ``levels=None`` enables all
-    checks. ``check_op`` forces all levels (L0-L4) on the named op and
-    its variants, ignoring ``status``; all other ops are skipped.
+    checks. ``check_op`` forces all levels (L0-L4) on the named op,
+    ignoring ``status``; all other ops are skipped.
     """
     if repo_root is None:
         repo_root = REPO_ROOT
@@ -3486,14 +3909,7 @@ def validate_manifest(
     if check_op is not None and check_op not in ops:
         return [f"--check-op: op '{check_op}' not found in manifest"], []
 
-    # --check-op scope: the named op plus its immediate variants, so a
-    # variant edit is caught when validating the primary.
-    variant_family: set[str] | None = None
-    if check_op is not None:
-        variant_family = {check_op} | {
-            name for name, ent in ops.items()
-            if isinstance(ent, dict) and ent.get("variant_of") == check_op
-        }
+    selected: set[str] | None = {check_op} if check_op is not None else None
 
     all_errors: list[str] = []
     all_warnings: list[str] = []
@@ -3502,17 +3918,9 @@ def validate_manifest(
     # warnings (advisory mode) once all per-op checks have run.
     strict_errors: list[str] = []
 
-    # Cross-entry checks (must run before per-entry checks), scoped to
-    # the variant family under --check-op so unrelated ops with invalid
-    # variant_of references don't fail the selected op.
-    if "schema" in levels:
-        all_errors.extend(
-            check_variant_of_consistency(ops, scope=variant_family)
-        )
-
     for op_name, entry in ops.items():
-        # --check-op scopes validation to the variant family; skip all others.
-        if variant_family is not None and op_name not in variant_family:
+        # --check-op scopes validation to that op; skip all others.
+        if selected is not None and op_name not in selected:
             continue
 
         if verbose:

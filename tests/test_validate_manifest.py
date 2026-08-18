@@ -143,15 +143,18 @@ def _make_bare_op(name="BareOp"):
     })
 
 
-def _infer_parity(validator, infer_fn, sig, *, name="FakeOp"):
+def _infer_parity(validator, infer_fn, sig, *, name="FakeOp", workloads=None):
     """Drive ``check_l2_infer_parity`` with a synthetic op class.
 
     Returns ``(errors, warnings)``.
     """
     cls = _make_op_cls_with_infer(infer_fn, name=name)
     warnings: list[str] = []
+    entry = {"signature": sig}
+    if workloads is not None:
+        entry["workloads"] = workloads
     errors = validator.check_l2_infer_parity(
-        name, {"signature": sig}, cls, warnings=warnings,
+        name, entry, cls, warnings=warnings,
     )
     return errors, warnings
 
@@ -702,56 +705,260 @@ class TestTorchCompileFullgraph:
         ), errors
 
 
-# variant_of: cross-entry consistency (R16)
+class TestOptionalInputs:
+    """R18: optional tensor inputs, where the name may appear, coverage."""
 
-class TestVariantOf:
-    """variant_of checks cross-entry consistency."""
-
-    def test_valid_variant_passes(self, validator):
-        """Variant pointing to existing primary with shared source passes."""
-        ops = {
-            "moe_fused_moe": _make_entry(),
-            "moe_fused_moe_cb": {
-                **_make_entry(),
-                "variant_of": "moe_fused_moe",
-            },
+    @staticmethod
+    def _entry(**over):
+        """Entry with one optional input ``w`` and both coverage rows."""
+        inputs = {
+            "x": {"dtype": "float16"},
+            "w": {"dtype": "same_as(x)", "optional": True},
         }
-        assert validator.check_variant_of_consistency(ops) == []
-
-    def test_malformed_entry_does_not_crash(self, validator):
-        """Non-dict entry must not crash variant_of check."""
-        ops = {"bad": 123, "ok": _make_entry()}
-        assert validator.check_variant_of_consistency(ops) == []
-
-    def test_violations_rejected(self, validator):
-        """Case table: missing target, chaining, and shared-source
-        mismatches all fail (R16)."""
-        mismatched_op = _make_entry()
-        mismatched_op["source"]["op"] = "different_op.py"
-        mismatched_op["variant_of"] = "primary"
-        cases = [
-            ("variant target missing",
-             {"v": {**_make_entry(), "variant_of": "nonexistent"}},
-             ["nonexistent", "does not exist"]),
-            ("variant chaining (single-level rule)",
-             {"primary": _make_entry(),
-              "variant_a": {**_make_entry(), "variant_of": "primary"},
-              "variant_b": {**_make_entry(), "variant_of": "variant_a"}},
-             ["chaining"]),
-            ("mismatched source.kernel",
-             {"primary": _make_entry(source_kernel="shared.py"),
-              "variant": {**_make_entry(source_kernel="different.py"),
-                          "variant_of": "primary"}},
-             ["source.kernel", "R16"]),
-            ("mismatched source.op",
-             {"primary": _make_entry(), "variant": mismatched_op},
-             ["source.op", "R16"]),
+        entry = _make_entry(
+            inputs=inputs, status="implemented",
+            kernel_map={"k": "K"},
+        )
+        entry["signature"]["shape_rules"] = [
+            "y.shape == x.shape",
+            "w is None or w.shape == (x.shape[1],)",
         ]
-        for desc, ops, substrings in cases:
-            errors = validator.check_variant_of_consistency(ops)
-            assert any(
-                all(s in e for s in substrings) for e in errors
-            ), f"{desc}: expected error with {substrings}, got: {errors}"
+        entry["workloads"] = [
+            {"x_shape": [1, 4096], "dtypes": ["float16"]},
+            {"x_shape": [1, 4096], "dtypes": ["float16"], "w_shape": [4096]},
+        ]
+        entry.update(over)
+        return entry
+
+    def test_conforming_entry_passes(self, validator):
+        assert validator.check_l0("Op", self._entry()) == []
+
+    @pytest.mark.parametrize("where", ["outputs", "params"])
+    def test_optional_only_on_inputs(self, validator, where):
+        entry = self._entry()
+        if where == "outputs":
+            entry["signature"]["outputs"]["y"]["optional"] = True
+            wanted = "may be optional"
+        else:
+            entry["signature"]["params"] = {"p": {"type": "int", "optional": True}}
+            wanted = "optionality with 'default'"
+        errors = validator.check_l0("Op", entry)
+        assert any(wanted in e for e in errors), errors
+
+    def test_optional_must_be_literal_true(self, validator):
+        entry = self._entry()
+        entry["signature"]["inputs"]["w"]["optional"] = "yes"
+        errors = validator.check_l0("Op", entry)
+        assert any("literal true" in e for e in errors), errors
+
+    def test_unguarded_use_in_shape_rules_rejected(self, validator):
+        entry = self._entry()
+        entry["signature"]["shape_rules"][1] = "w.shape == (x.shape[1],)"
+        errors = validator.check_l0("Op", entry)
+        assert any("without a preceding 'w is None'" in e for e in errors), errors
+
+    def test_is_not_none_and_form_rejected(self, validator):
+        """The ``and`` form fails a legal absent call, so it is not accepted."""
+        entry = self._entry()
+        entry["signature"]["shape_rules"][1] = (
+            "w is not None and w.shape == (x.shape[1],)"
+        )
+        errors = validator.check_l0("Op", entry)
+        assert any("without a preceding 'w is None'" in e for e in errors), errors
+
+    def test_each_optional_guards_its_own_use(self, validator):
+        """A rule reading two optionals carries a guard for each."""
+        entry = self._entry()
+        entry["signature"]["inputs"]["v"] = {
+            "dtype": "same_as(x)", "optional": True,
+        }
+        entry["signature"]["shape_rules"][1] = (
+            "w is None or v is None or w.shape == v.shape"
+        )
+        entry["workloads"][1]["v_shape"] = [4096]
+        assert validator.check_l0("Op", entry) == []
+
+    def test_guard_need_not_be_the_first_disjunct(self, validator):
+        """`or` short-circuits per operand, so an unrelated leading test is fine."""
+        entry = self._entry()
+        entry["signature"]["shape_rules"][1] = (
+            "x.ndim == 3 or w is None or w.shape == (x.shape[1],)"
+        )
+        assert validator.check_l0("Op", entry) == []
+
+    def test_guard_after_the_use_rejected(self, validator):
+        entry = self._entry()
+        entry["signature"]["shape_rules"][1] = (
+            "w.shape == (x.shape[1],) or w is None"
+        )
+        errors = validator.check_l0("Op", entry)
+        assert any("without a preceding 'w is None'" in e for e in errors), errors
+
+    def test_optional_inside_a_call_argument_needs_a_guard(self, validator):
+        entry = self._entry()
+        entry["signature"]["shape_rules"][1] = (
+            "y.shape == broadcast_shapes(x.shape, w.shape)"
+        )
+        errors = validator.check_l0("Op", entry)
+        assert any("without a preceding 'w is None'" in e for e in errors), errors
+
+    def test_co_occurrence_rule_allowed(self, validator):
+        """The authored form for a group: presence tested on both sides."""
+        entry = self._entry()
+        entry["signature"]["inputs"]["v"] = {
+            "dtype": "same_as(x)", "optional": True,
+        }
+        entry["signature"]["shape_rules"].append("(w is None) == (v is None)")
+        entry["workloads"][1]["v_shape"] = [4096]
+        assert validator.check_l0("Op", entry) == []
+
+    def test_roofline_rejects_attribute_access(self, validator):
+        entry = self._entry()
+        entry["roofline"] = {
+            "vars": {"C": "w.shape[0]"}, "flops": "2 * C", "bytes": "C",
+        }
+        errors = validator.check_l0("Op", entry)
+        assert any("other than a presence test" in e for e in errors), errors
+
+    def test_roofline_allows_presence_test_in_vars(self, validator):
+        entry = self._entry()
+        entry["roofline"] = {
+            "vars": {"affine": "w is not None"},
+            "flops": "(5 if affine else 3) * 2",
+            "bytes": "2",
+        }
+        assert validator.check_l0("Op", entry) == []
+
+    def test_roofline_presence_test_in_flops_rejected(self, validator):
+        """The arithmetic layer cannot resolve a tensor name, presence or not."""
+        entry = self._entry()
+        entry["roofline"] = {
+            "flops": "(5 if w is not None else 3) * 2", "bytes": "2",
+        }
+        errors = validator.check_l0("Op", entry)
+        assert any("names optional input 'w'" in e for e in errors), errors
+
+    def test_dtype_combos_column_rejected(self, validator):
+        entry = self._entry()
+        entry["signature"]["dtype_combos"] = [
+            {"x": "float16", "w": "float16", "y": "float16"},
+        ]
+        errors = validator.check_l0("Op", entry)
+        assert any("has a column for optional input" in e for e in errors), errors
+
+    def test_same_as_reference_rejected(self, validator):
+        entry = self._entry()
+        entry["signature"]["outputs"]["y"]["dtype"] = "same_as(w)"
+        errors = validator.check_l0("Op", entry)
+        assert any("through same_as()" in e for e in errors), errors
+
+    def test_optional_local_symbol_may_not_leak(self, validator):
+        entry = self._entry()
+        entry["signature"]["inputs"]["x"]["shape"] = "[B, C]"
+        entry["signature"]["inputs"]["w"]["shape"] = "[G]"
+        entry["signature"]["outputs"]["y"]["shape"] = "[B, G]"
+        errors = validator.check_l0("Op", entry)
+        assert any("bound only by optional input" in e for e in errors), errors
+
+    def test_optional_may_bind_its_own_symbol(self, validator):
+        entry = self._entry()
+        entry["signature"]["inputs"]["x"]["shape"] = "[B, C]"
+        entry["signature"]["inputs"]["w"]["shape"] = "[G]"
+        entry["signature"]["outputs"]["y"]["shape"] = "[B, C]"
+        assert validator.check_l0("Op", entry) == []
+
+    def test_coverage_needs_a_row_that_passes_it(self, validator):
+        entry = self._entry()
+        entry["workloads"] = [{"x_shape": [1, 4096], "dtypes": ["float16"]}]
+        errors = validator.check_l0("Op", entry)
+        assert any("no workload row passes" in e for e in errors), errors
+
+    def test_coverage_needs_a_row_that_omits_it(self, validator):
+        entry = self._entry()
+        entry["workloads"] = [
+            {"x_shape": [1, 4096], "dtypes": ["float16"], "w_shape": [4096]},
+        ]
+        errors = validator.check_l0("Op", entry)
+        assert any("every workload row passes" in e for e in errors), errors
+
+    def test_coverage_counts_per_input_not_per_combination(self, validator):
+        """Two optionals need 2 rows, not 4 (R18.2)."""
+        entry = self._entry()
+        entry["signature"]["inputs"]["v"] = {
+            "dtype": "same_as(x)", "optional": True,
+        }
+        entry["workloads"] = [
+            {"x_shape": [1, 4096], "dtypes": ["float16"]},
+            {"x_shape": [1, 4096], "dtypes": ["float16"],
+             "w_shape": [4096], "v_shape": [4096]},
+        ]
+        assert validator.check_l0("Op", entry) == []
+
+    def test_spec_only_entries_exempt_from_coverage(self, validator):
+        entry = self._entry(status="spec-only")
+        entry["workloads"] = [{"x_shape": [1, 4096], "dtypes": ["float16"]}]
+        errors = validator.check_l0("Op", entry)
+        assert not any("workload row" in e for e in errors), errors
+
+    @staticmethod
+    def _sig_with_optional():
+        return _sig(
+            {
+                "x": {"dtype": "float16", "shape": "[M]"},
+                "mask": {"dtype": "int32", "optional": True},
+            },
+            {"y": {"dtype": "same_as(x)"}},
+            params={"n": {"type": "int"}},
+            shape_rules=["mask.shape == (n,)", "y.shape == (n,)"],
+        )
+
+    def test_each_probe_uses_a_row_with_its_presence_pattern(self, validator):
+        """The supplying probe runs under the params of a row that supplies it.
+
+        Both probes drawing from the first row would hide any param whose value
+        only differs on the rows that pass the optional input.
+        """
+        seen: list[int] = []
+
+        def infer(self, x_shape, mask_shape=None):
+            seen.append(self.n)
+            return {"y": (self.n,)}
+
+        errors, _ = _infer_parity(
+            validator, infer, self._sig_with_optional(), name="OptRowOp",
+            workloads=[
+                {"n": 3, "dtypes": ["float16"]},
+                {"n": 7, "dtypes": ["float16"], "mask_shape": [7]},
+            ],
+        )
+        assert errors == [], errors
+        assert seen == [7, 3], seen
+
+    def test_both_presence_cases_are_probed(self, validator):
+        """The absent probe passes ``None`` and skips rules naming the input."""
+        seen: list[object] = []
+
+        def infer(self, x_shape, mask_shape=None):
+            seen.append(mask_shape)
+            return {"y": (self.n,)}
+
+        errors, _ = _infer_parity(
+            validator, infer, self._sig_with_optional(), name="OptProbeOp",
+            workloads=[{"n": 7, "dtypes": ["float16"]}],
+        )
+        assert errors == [], errors
+        assert seen == [(7,), None], seen
+
+    def test_an_absent_probe_failure_names_the_withheld_input(self, validator):
+        """An op that only works with the map supplied must not pass silently."""
+        def infer(self, x_shape, mask_shape=None):
+            return {"y": (mask_shape[0],)}
+
+        errors, _ = _infer_parity(
+            validator, infer, self._sig_with_optional(), name="OptBrokenOp",
+            workloads=[{"n": 7, "dtypes": ["float16"]}],
+        )
+        assert any("mask absent" in e for e in errors), errors
 
 
 # signature: Op.forward() consistency
@@ -2035,6 +2242,78 @@ class TestParamDefaultOutputShapePin:
         assert errors == [], errors
 
 
+class TestRequiredParamWitness:
+    """A param with no default is probed at a schema-valid witness value."""
+
+    def test_output_sized_by_a_required_param_is_probed_at_the_workload_value(
+        self, validator,
+    ):
+        """``self.<required param>`` must resolve, and to the pinned value."""
+        sig = _sig(
+            {"x": {"dtype": "float16", "shape": "[M]"}},
+            {"y": {"dtype": "same_as(x)"}},
+            params={"n": {"type": "int"}},
+            shape_rules=["y.shape == (n,)"],
+        )
+
+        def infer(self, x_shape):
+            return {"y": (self.n,)}
+
+        errors, warnings = _infer_parity(
+            validator, infer, sig, name="RequiredParamOp",
+            workloads=[{"n": 7, "dtypes": ["float16"]}],
+        )
+        assert errors == [], errors
+        assert not any("AttributeError" in w for w in warnings), warnings
+
+    def test_witness_falls_back_to_a_type_valid_positive_scalar(self, validator):
+        """No workload pins the param, so the probe still supplies a value."""
+        sig = _sig(
+            {"x": {"dtype": "float16", "shape": "[M]"}},
+            {"y": {"dtype": "same_as(x)"}},
+            params={"n": {"type": "int"}},
+            shape_rules=["y.shape == (n,)"],
+        )
+
+        def infer(self, x_shape):
+            return {"y": (self.n,)}
+
+        errors, _ = _infer_parity(validator, infer, sig, name="NoWorkloadOp")
+        assert errors == [], errors
+
+    def test_a_wrong_extent_is_still_a_parity_error(self, validator):
+        """The witness makes the probe run; it must not make it pass."""
+        sig = _sig(
+            {"x": {"dtype": "float16", "shape": "[M]"}},
+            {"y": {"dtype": "same_as(x)"}},
+            params={"n": {"type": "int"}},
+            shape_rules=["y.shape == (n,)"],
+        )
+
+        def infer(self, x_shape):
+            return {"y": (self.n + 1,)}
+
+        errors, _ = _infer_parity(
+            validator, infer, sig, name="WrongExtentOp",
+            workloads=[{"n": 7, "dtypes": ["float16"]}],
+        )
+        assert any("violates shape_rules" in e for e in errors), errors
+
+    def test_mock_input_shapes_take_the_param_value(self, validator):
+        """A dim name that is also a param carries one value throughout."""
+        sig = _sig(
+            {"m": {"dtype": "int32"}},
+            {"y": {"dtype": "int32"}},
+            params={"n": {"type": "int"}},
+            shape_rules=["m.shape == (n,)"],
+        )
+        _, dim_sizes = validator._mock_input_shapes(
+            sig, validator._param_env(sig, [{"n": 7, "dtypes": ["int32"]}]),
+        )
+        assert dim_sizes["n"] == 7
+
+
+
 # Bench checks
 class TestBench:
     """bench checks that bench files use manifest workloads and op roofline.
@@ -2211,89 +2490,6 @@ class TestCheckOp:
         assert len(target_errors) > 0, (
             "target_op should have validation errors from forced L4 check"
         )
-
-    def test_check_op_ignores_unrelated_variant_of_errors(self, validator, tmp_path):
-        """--check-op scopes variant_of checks to the variant family;
-        unrelated ops with bad references must not fail the run."""
-        other_entry = _make_entry()
-        other_entry["variant_of"] = "nonexistent_primary"
-        manifest_file = _write_manifest(
-            tmp_path, {"target_op": _make_entry(), "other_op": other_entry},
-        )
-
-        errors, _ = validator.validate_manifest(
-            manifest_path=manifest_file,
-            repo_root=tmp_path,
-            check_op="target_op",
-        )
-        variant_errors = [e for e in errors if "variant_of" in e]
-        assert variant_errors == [], variant_errors
-
-        errors_all, _ = validator.validate_manifest(
-            manifest_path=manifest_file,
-            repo_root=tmp_path,
-            check_op=None,
-        )
-        variant_errors_all = [e for e in errors_all if "variant_of" in e]
-        assert len(variant_errors_all) > 0, (
-            "Without --check-op, invalid variant_of should be reported"
-        )
-
-    def test_check_op_validates_variant_family(self, validator, tmp_path):
-        """--check-op on a primary also validates its immediate variants,
-        so a variant edit breaking R16 cannot slip through."""
-        primary = _make_entry(source_kernel="shared_kernel.py")
-        valid_variant = _make_entry(source_kernel="shared_kernel.py")
-        valid_variant["variant_of"] = "primary_op"
-        # Broken variant: different source.kernel violates R16.
-        broken_variant = _make_entry(source_kernel="different_kernel.py")
-        broken_variant["variant_of"] = "primary_op"
-        manifest_file = _write_manifest(tmp_path, {
-            "primary_op": primary,
-            "good_variant": valid_variant,
-            "bad_variant": broken_variant,
-        })
-
-        errors, _ = validator.validate_manifest(
-            manifest_path=manifest_file,
-            repo_root=tmp_path,
-            check_op="primary_op",
-        )
-        r16_errors = [e for e in errors if "bad_variant" in e and "R16" in e]
-        assert len(r16_errors) > 0, errors
-
-        good_r16 = [e for e in errors if "good_variant" in e and "R16" in e]
-        assert good_r16 == [], good_r16
-
-    def test_check_op_variant_family_runs_schema_on_variants(self, validator, tmp_path):
-        """--check-op on primary runs per-op schema checks on variants too."""
-        primary = _make_entry(source_kernel="shared.py")
-        broken_variant = {
-            "family": "test",
-            "signature": {
-                "inputs": {"x": {"dtype": "float16"}},
-                "outputs": {"y": {"dtype": "same_as(x)"}},
-            },
-            "workloads": [{"x_shape": [1, 4096], "dtypes": ["float16"]}],
-            "roofline": {"flops": "2 * M", "bytes": "M * 2"},
-            "source": {
-                "kernel": "shared.py",
-                # missing "op", "test", "bench" fields
-            },
-            "variant_of": "primary_op",
-        }
-        manifest_file = _write_manifest(tmp_path, {
-            "primary_op": primary,
-            "broken_var": broken_variant,
-        })
-
-        errors, _ = validator.validate_manifest(
-            manifest_path=manifest_file,
-            repo_root=tmp_path,
-            check_op="primary_op",
-        )
-        schema_errors = [e for e in errors if "broken_var" in e and "source" in e]
-        assert len(schema_errors) > 0, errors
 
     def test_check_op_cli_parsing(self, validator):
         """_parse_check_op extracts the op name from argv; a missing

@@ -1,11 +1,8 @@
 """Routed Mixture-of-Experts (MoE) FFN operators.
 
-Two manifest identities share a single composite implementation:
-
-- ``FusedMoeFwdOp`` — routing + expert FFN without a routing correction bias
-  (Qwen3 / DeepSeek-V3 style).
-- ``FusedMoeFwdCbFwdOp`` — same flow but accepts a per-expert correction bias
-  applied during top-k selection (Kimi K2 style).
+``FusedMoeFwdOp`` is routing + expert FFN. Passing ``correction_bias`` adds the
+per-expert bias during top-k selection (Kimi K2 style); withholding it selects
+straight from the gating scores (Qwen3 / DeepSeek-V3 style).
 
 The shared core (`FusedMoe`) wires `FusedTopKOp` (routing),
 `FusedMoEPrepareAndFinalize` (quantization / EP dispatch), and an
@@ -24,21 +21,18 @@ from tileops.ops.moe.abc import (
 )
 from tileops.ops.moe.fused_topk import FusedTopKOp
 from tileops.ops.moe.prepare_finalize.no_dp_ep import MoEPrepareAndFinalizeNoDPEP
-from tileops.ops.moe.routed_expert import (
-    FusedMoEExpertsNopadPersistent3WGFwdOp,
-)
+from tileops.ops.moe.routed_expert import FusedMoEExpertsNopadPersistent3WGFwdOp
 
 from ..op_base import Op
 
-__all__ = ["FusedMoe", "FusedMoeFwdCbFwdOp", "FusedMoeFwdOp"]
+__all__ = ["FusedMoe", "FusedMoeFwdOp"]
 
 
 class FusedMoe(Op):
     """Shared composite implementation for routed MoE FFN ops.
 
-    Concrete manifest identities (`FusedMoeFwdOp`, `FusedMoeFwdCbFwdOp`)
-    subclass this to pin the correction-bias variant; both share the
-    routing-and-expert pipeline below.
+    The concrete manifest identity (`FusedMoeFwdOp`) subclasses this; the
+    routing-and-expert pipeline below is shared with `SharedFusedMoE`.
 
     Args:
         num_tokens: T -- number of input tokens.
@@ -48,9 +42,12 @@ class FusedMoe(Op):
         ffn_size: F -- per-expert intermediate dimension.
         scoring_func: "softmax" (Qwen3) or "sigmoid" (Kimi K2 / DeepSeek-V3).
         renormalize: Renormalize top-k weights to sum to 1.
-        with_correction_bias: Accept `correction_bias` during routing.
         routed_scaling_factor: Multiplier on expert output (Kimi K2: 2.827).
         expert_map: [E_global] int32 for Expert Parallel local filtering.
+        num_experts_local: Number of experts this rank owns. Required with
+            `expert_map` and rejected without it: it sizes the expert
+            pipeline's kernels, which are built here, and reading it off the
+            map would mean a device read at construction.
         prepare_finalize: Override the PrepareAndFinalize implementation.
         experts: Override the Experts implementation.
         kernel_map: Override the dispatched kernel map.
@@ -65,15 +62,24 @@ class FusedMoe(Op):
         ffn_size: int,
         scoring_func: str = "softmax",
         renormalize: bool = False,
-        with_correction_bias: bool = False,
         routed_scaling_factor: float = 1.0,
         expert_map: Optional[torch.Tensor] = None,
+        num_experts_local: Optional[int] = None,
         prepare_finalize: Optional[FusedMoEPrepareAndFinalize] = None,
         experts: Optional[FusedMoEExpertsModular] = None,
         kernel_map: Optional[Dict[str, Kernel]] = None,
         *,
         activation: str = "silu_and_mul",
     ):
+        if (expert_map is None) != (num_experts_local is None):
+            raise ValueError(
+                "expert_map and num_experts_local go together: the map carries the "
+                "global-to-local ids read at launch, the count sizes the kernels "
+                "built here. Got "
+                f"expert_map={'a map' if expert_map is not None else None}, "
+                f"num_experts_local={num_experts_local}."
+            )
+
         self.num_tokens = num_tokens
         self.num_experts = num_experts
         self.top_k = top_k
@@ -81,9 +87,11 @@ class FusedMoe(Op):
         self.ffn_size = ffn_size
         self.scoring_func = scoring_func
         self.renormalize = renormalize
-        self.with_correction_bias = with_correction_bias
         self.routed_scaling_factor = routed_scaling_factor
         self.expert_map = expert_map
+        self.num_experts_local = (
+            num_experts if num_experts_local is None else num_experts_local
+        )
 
         self.dispatch_kernel(kernel_map)
 
@@ -91,7 +99,6 @@ class FusedMoe(Op):
             top_k=top_k,
             scoring_func=scoring_func,
             renormalize=renormalize,
-            with_correction_bias=with_correction_bias,
             kernel_map=kernel_map,
         )
 
@@ -140,13 +147,13 @@ class FusedMoe(Op):
             self._experts = FusedMoEExpertsNopadPersistent3WGFwdOp(
                 num_tokens=num_tokens,
                 num_experts=num_experts,
+                num_experts_local=self.num_experts_local,
                 top_k=top_k,
                 hidden_size=hidden_size,
                 ffn_size=ffn_size,
-                activation=activation,
                 routed_scaling_factor=routed_scaling_factor,
-                expert_map=expert_map,
                 kernel_map=kernel_map,
+                activation=activation,
             )
 
     @property
@@ -162,6 +169,12 @@ class FusedMoe(Op):
         correction_bias: Optional[torch.Tensor] = None, # [E] float32
     ) -> torch.Tensor:                                  # [T, H]
         topk_weights, topk_ids = self._fused_topk(gating_output, correction_bias)
+        # The roofline counts the bias bytes of the call that ran, so this is
+        # set once routing succeeded. Keep the shape, not the tensor: the op
+        # need not hold the caller's memory.
+        self.correction_bias_shape = (
+            None if correction_bias is None else tuple(correction_bias.shape)
+        )
 
         r = self._prepare.prepare(
             hidden_states, topk_weights, topk_ids,
@@ -196,10 +209,13 @@ class FusedMoe(Op):
 
 
 class FusedMoeFwdOp(FusedMoe):
-    """Routed MoE FFN without a routing correction bias.
+    """Routed MoE FFN.
 
-    Covers Qwen3 (softmax) and DeepSeek-V3 (sigmoid) style configurations
-    where top-k is computed directly from the gating scores.
+    Covers Qwen3 (softmax) and DeepSeek-V3 (sigmoid) style configurations where
+    top-k comes straight from the gating scores, and Kimi K2 style ones where a
+    per-expert ``correction_bias`` is passed: top-k is then selected from
+    ``sigmoid(score) + correction_bias`` while the final weights use the
+    original (unbiased) scores, renormalized.
     """
 
     def __init__(
@@ -213,6 +229,7 @@ class FusedMoeFwdOp(FusedMoe):
         renormalize: bool = False,
         routed_scaling_factor: float = 1.0,
         expert_map: Optional[torch.Tensor] = None,
+        num_experts_local: Optional[int] = None,
         prepare_finalize: Optional[FusedMoEPrepareAndFinalize] = None,
         experts: Optional[FusedMoEExpertsModular] = None,
         kernel_map: Optional[Dict[str, Kernel]] = None,
@@ -227,75 +244,11 @@ class FusedMoeFwdOp(FusedMoe):
             ffn_size=ffn_size,
             scoring_func=scoring_func,
             renormalize=renormalize,
-            with_correction_bias=False,
             routed_scaling_factor=routed_scaling_factor,
             expert_map=expert_map,
+            num_experts_local=num_experts_local,
             prepare_finalize=prepare_finalize,
             experts=experts,
             kernel_map=kernel_map,
             activation=activation,
-        )
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        gating_output: torch.Tensor,
-        w_gate_up: torch.Tensor,
-        w_down: torch.Tensor,
-    ) -> torch.Tensor:
-        return super().forward(hidden_states, gating_output, w_gate_up, w_down, None)
-
-
-class FusedMoeFwdCbFwdOp(FusedMoe):
-    """Routed MoE FFN with a per-expert routing correction bias.
-
-    Covers Kimi K2 style configurations: top-k is selected from
-    ``sigmoid(score) + correction_bias`` while the final weights use the
-    original (unbiased) sigmoid scores, renormalized.
-    """
-
-    def __init__(
-        self,
-        num_tokens: int,
-        num_experts: int,
-        top_k: int,
-        hidden_size: int,
-        ffn_size: int,
-        scoring_func: str = "sigmoid",
-        renormalize: bool = False,
-        routed_scaling_factor: float = 1.0,
-        expert_map: Optional[torch.Tensor] = None,
-        prepare_finalize: Optional[FusedMoEPrepareAndFinalize] = None,
-        experts: Optional[FusedMoEExpertsModular] = None,
-        kernel_map: Optional[Dict[str, Kernel]] = None,
-        *,
-        activation: str = "silu_and_mul",
-    ):
-        super().__init__(
-            num_tokens=num_tokens,
-            num_experts=num_experts,
-            top_k=top_k,
-            hidden_size=hidden_size,
-            ffn_size=ffn_size,
-            scoring_func=scoring_func,
-            renormalize=renormalize,
-            with_correction_bias=True,
-            routed_scaling_factor=routed_scaling_factor,
-            expert_map=expert_map,
-            prepare_finalize=prepare_finalize,
-            experts=experts,
-            kernel_map=kernel_map,
-            activation=activation,
-        )
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        gating_output: torch.Tensor,
-        correction_bias: torch.Tensor,
-        w_gate_up: torch.Tensor,
-        w_down: torch.Tensor,
-    ) -> torch.Tensor:
-        return super().forward(
-            hidden_states, gating_output, w_gate_up, w_down, correction_bias,
         )
